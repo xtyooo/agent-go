@@ -1,0 +1,28 @@
+server:
+  port: "8888"
+
+model:
+  base-url: "https://dashscope.aliyuncs.com/compatible-mode"
+  api-key: "sk-de1035fba7144d08a84d276b4862ded9"
+  name: "qwen3.6-flash-2026-04-16"
+
+agent:
+  max-rounds: 5
+
+memory:
+  enabled: false
+  dsn: "root:password@tcp(127.0.0.1:3306)/agent_go?charset=utf8mb4&parseTime=true&loc=Local"
+  max-history-records: 30
+  auto-migrate: true
+  max-open-conns: 10
+  max-idle-conns: 5
+  conn-max-lifetime-seconds: 300
+
+tools:
+  tavily:
+    endpoint: "https://tavily.ivanli.cc/api/tavily/search"
+    api-key: "th-bwGh-pXEDzGeoWN8KnjD6OdsUbva9"
+    project-id: ""
+    search-depth: "basic"
+    max-results: 5
+    timeout-seconds: 20

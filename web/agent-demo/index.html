@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Agent Demo Console</title>
+  <link rel="stylesheet" href="./demo.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-icon" aria-hidden="true">⌘</span>
+        <span>Agent Demo Console</span>
+      </div>
+      <div class="run-title">
+        <span id="runStatus" class="status-pill idle"><span class="status-dot"></span>空闲</span>
+        <strong>任务：</strong>
+        <span id="headerTask">分析项目中的登录流程，并给出可优化建议</span>
+      </div>
+      <div class="top-actions">
+        <button class="button button-secondary" type="button">演示模式</button>
+        <button class="icon-button" type="button" aria-label="导出">⇧</button>
+        <button class="icon-button" type="button" aria-label="设置">⚙</button>
+        <button class="icon-button" type="button" aria-label="更多">⋮</button>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <aside class="panel config-panel">
+        <div class="panel-header">
+          <h2>任务与配置</h2>
+          <button class="ghost-icon" type="button" aria-label="收起">⌃</button>
+        </div>
+
+        <section class="config-section">
+          <h3>1. 任务输入</h3>
+          <label class="field-label" for="taskInput">用户问题</label>
+          <textarea id="taskInput" maxlength="500">分析项目中的登录流程，并给出可优化建议。</textarea>
+          <div class="counter"><span id="taskCount">0</span>/500</div>
+        </section>
+
+        <section class="config-section">
+          <h3>2. 后端连接</h3>
+          <label class="field-label" for="apiBaseUrl">API Base URL</label>
+          <input id="apiBaseUrl" type="text" value="http://localhost:8888">
+          <p class="field-hint">前端独立运行，通过 SSE 调用 /agent/chat/stream。</p>
+        </section>
+
+        <section class="config-section">
+          <h3>3. Agent 类型</h3>
+          <label class="field-label" for="agentType">类型</label>
+          <select id="agentType">
+            <option>代码分析专家</option>
+            <option>WebSearch ReAct Agent</option>
+            <option>通用问答 Agent</option>
+          </select>
+        </section>
+
+        <section class="config-section">
+          <h3>4. 模型与参数</h3>
+          <div class="form-row">
+            <label for="modelName">模型</label>
+            <select id="modelName">
+              <option>gpt-4o</option>
+              <option>gpt-4.1</option>
+              <option>o4-mini</option>
+            </select>
+          </div>
+          <div class="form-row">
+            <label for="temperature">温度 (Temperature)</label>
+            <input id="temperature" type="range" min="0" max="1" step="0.1" value="0.2">
+            <output id="temperatureValue">0.2</output>
+          </div>
+          <div class="form-row">
+            <label for="maxTurns">最大轮次 (Max Turns)</label>
+            <input id="maxTurns" type="range" min="1" max="20" step="1" value="10">
+            <output id="maxTurnsValue">10</output>
+          </div>
+          <div class="form-row">
+            <label for="contextWindow">上下文窗口</label>
+            <select id="contextWindow">
+              <option>128K</option>
+              <option>64K</option>
+              <option>32K</option>
+            </select>
+          </div>
+        </section>
+
+        <section class="config-section">
+          <h3>5. 工具 (Tooling)</h3>
+          <div id="toolToggles" class="tool-list"></div>
+        </section>
+
+        <section class="config-section">
+          <h3>6. 控制</h3>
+          <div class="control-grid">
+            <button id="startButton" class="button button-primary" type="button">▶ 开始运行</button>
+            <button id="pauseButton" class="button" type="button">Ⅱ 暂停</button>
+            <button id="resetButton" class="button button-danger" type="button">↻ 重置</button>
+          </div>
+        </section>
+      </aside>
+
+      <section class="panel timeline-panel">
+        <div class="panel-header">
+          <h2>执行过程 / 时间线</h2>
+        </div>
+        <div class="task-card">
+          <div class="task-mark">◎</div>
+          <div>
+            <h1 id="taskTitle">分析项目中的登录流程，并给出可优化建议</h1>
+            <p>开始时间：<span id="startedAt">未开始</span></p>
+          </div>
+          <div class="task-meta">
+            <span id="taskBadge" class="badge pending">待运行</span>
+            <span>总轮次：<strong id="turnCount">6</strong></span>
+          </div>
+        </div>
+        <div id="timeline" class="timeline"></div>
+        <div class="final-output">
+          <div>
+            <h3>最终输出</h3>
+            <p id="finalOutput">点击“开始运行”后，这里会实时累积模型文本输出。</p>
+          </div>
+          <button class="button button-secondary" type="button">查看完整输出</button>
+        </div>
+      </section>
+
+      <aside class="panel inspector-panel">
+        <div class="panel-header">
+          <h2>观察与调试</h2>
+          <button class="ghost-icon" type="button" aria-label="收起">⌃</button>
+        </div>
+
+        <section class="inspect-card">
+          <h3>当前上下文摘要</h3>
+          <dl class="summary-list">
+            <div><dt>项目</dt><dd>awesome-project (Go)</dd></div>
+            <div><dt>当前聚焦</dt><dd>登录与认证流程分析</dd></div>
+            <div><dt>已加载文件</dt><dd>12 个</dd></div>
+            <div><dt>相关模块</dt><dd>auth, users, sessions, api</dd></div>
+          </dl>
+        </section>
+
+        <section class="inspect-card">
+          <div class="tabs" role="tablist" aria-label="运行时检查">
+            <button class="tab is-active" data-tab="request" type="button">Request</button>
+            <button class="tab" data-tab="messages" type="button">Messages</button>
+            <button class="tab" data-tab="tools" type="button">Tools</button>
+          </div>
+          <pre id="runtimePreview" class="code-preview"></pre>
+        </section>
+
+        <section class="inspect-card">
+          <h3>运行统计</h3>
+          <div class="metrics-grid">
+            <div><span>轮次</span><strong id="metricTurns">6</strong></div>
+            <div><span>总 Token</span><strong>12,842</strong></div>
+            <div><span>总耗时</span><strong>1m 04s</strong></div>
+            <div><span>预计成本</span><strong>$0.032</strong></div>
+          </div>
+        </section>
+
+        <section class="inspect-card">
+          <h3>中间文件 / 变量</h3>
+          <ul class="file-list">
+            <li><span>project_structure.json</span><small>8.4 KB</small></li>
+            <li><span>login_related_files.json</span><small>6.1 KB</small></li>
+            <li><span>auth_flow_analysis.md</span><small>14.2 KB</small></li>
+            <li><span>issues_summary.md</span><small>3.7 KB</small></li>
+            <li><span>optimization_suggestions.md</span><small>5.3 KB</small></li>
+          </ul>
+        </section>
+
+        <section class="feedback-box">
+          <h3>人工反馈</h3>
+          <textarea placeholder="请输入你的反馈或指令..."></textarea>
+          <div class="feedback-actions">
+            <span>0/1000</span>
+            <button class="button button-primary" type="button">发送</button>
+          </div>
+        </section>
+      </aside>
+    </main>
+
+    <footer class="statusbar">
+      <span>运行 ID: <strong id="runId">run_20240520_143218_ab12cd</strong></span>
+      <span>延迟：1.2s <i class="status-dot"></i></span>
+      <span>总耗时：1m 04s</span>
+      <span>总 Token：12,842</span>
+      <span>预计成本：$0.032</span>
+      <span>最近操作：14:33:22</span>
+      <span><i class="status-dot"></i> Agent 状态：空闲</span>
+    </footer>
+  </div>
+  <script src="./demo.js"></script>
+</body>
+</html>
