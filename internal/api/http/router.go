@@ -3,6 +3,10 @@ package http
 import (
 	"log/slog"
 	"net/http"
+	"os"
+	"path"
+	"path/filepath"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/learn-demo/agent-go/internal/runtime/agent"
@@ -26,9 +30,6 @@ func NewRouterWithAgents(logger *slog.Logger, agents map[string]agent.Agent, tas
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
-	r.Options("/*", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusNoContent)
-	})
 
 	r.Route("/agent", func(r chi.Router) {
 		r.Get("/chat/stream", handler.ChatStream)
@@ -51,7 +52,73 @@ func NewRouterWithAgents(logger *slog.Logger, agents map[string]agent.Agent, tas
 		r.Post("/{sessionId}/rename", sessionHandler.RenameSession)
 	})
 
+	mountWebApp(r, logger, webDistDir())
+
 	return r
+}
+
+func mountWebApp(r chi.Router, logger *slog.Logger, distDir string) {
+	info, err := os.Stat(distDir)
+	if err != nil || !info.IsDir() {
+		if logger != nil {
+			logger.Warn("web app dist not found, skip static mount", "dir", distDir, "error", err)
+		}
+		return
+	}
+
+	fileServer := http.FileServer(http.Dir(distDir))
+	r.Get("/*", func(w http.ResponseWriter, r *http.Request) {
+		cleanPath := strings.TrimPrefix(path.Clean("/"+r.URL.Path), "/")
+		if cleanPath == "" || cleanPath == "." {
+			cleanPath = "index.html"
+		}
+		fullPath := filepath.Join(distDir, filepath.FromSlash(cleanPath))
+		if info, err := os.Stat(fullPath); err == nil && !info.IsDir() {
+			fileServer.ServeHTTP(w, r)
+			return
+		}
+		http.ServeFile(w, r, filepath.Join(distDir, "index.html"))
+	})
+}
+
+func webDistDir() string {
+	if override := strings.TrimSpace(os.Getenv("KIMO_WEB_DIST_DIR")); override != "" {
+		return override
+	}
+
+	defaultDir := filepath.Join("web", "agent-demo", "dist")
+	candidates := []string{defaultDir}
+	if cwd, err := os.Getwd(); err == nil {
+		candidates = appendWebDistCandidates(candidates, cwd)
+	}
+	if exePath, err := os.Executable(); err == nil {
+		exeDir := filepath.Dir(exePath)
+		candidates = append(candidates, filepath.Join(exeDir, "dist"))
+		candidates = appendWebDistCandidates(candidates, exeDir)
+	}
+
+	for _, candidate := range candidates {
+		if info, err := os.Stat(candidate); err == nil && info.IsDir() {
+			return candidate
+		}
+	}
+	return defaultDir
+}
+
+func appendWebDistCandidates(candidates []string, start string) []string {
+	dir, err := filepath.Abs(start)
+	if err != nil {
+		dir = start
+	}
+	for {
+		candidates = append(candidates, filepath.Join(dir, "web", "agent-demo", "dist"))
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	return candidates
 }
 
 func corsMiddleware(next http.Handler) http.Handler {
@@ -66,6 +133,11 @@ func corsMiddleware(next http.Handler) http.Handler {
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, PUT, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 		w.Header().Set("Access-Control-Expose-Headers", "Content-Type")
+
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 
 		next.ServeHTTP(w, r)
 	})

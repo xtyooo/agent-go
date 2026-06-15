@@ -51,8 +51,20 @@
             </TabSessionState>
           </value>
         </entry>
+        <entry key="4">
+          <value>
+            <TabSessionState>
+              <option name="provider" value="codex" />
+              <option name="sessionId" value="019eca91-753e-74e0-a896-8dab9b73018e" />
+              <option name="cwd" value="$PROJECT_DIR$" />
+              <option name="model" value="gpt-5.5" />
+              <option name="permissionMode" value="bypassPermissions" />
+              <option name="reasoningEffort" value="high" />
+            </TabSessionState>
+          </value>
+        </entry>
       </map>
     </option>
-    <option name="tabCount" value="4" />
+    <option name="tabCount" value="5" />
   </component>
 </project>

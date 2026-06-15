@@ -113,25 +113,13 @@ func (a *Agent) Run(ctx context.Context, input agent.Input) (<-chan event.Event,
 			"temperature", cfg.temperature,
 		)
 
-		send := func(evt event.Event) bool {
-			select {
-			case <-ctx.Done():
-				logger.Warn("\U0001F6D1 Plan-Execute 事件发送被取消",
-					"conversation_id", input.ConversationID,
-					"event_type", evt.Type,
-					"elapsed_ms", elapsedMillis(startedAt),
-					"error", ctx.Err(),
-				)
-				return false
-			default:
-			}
-			select {
-			case <-ctx.Done():
-				return false
-			case events <- evt:
-				runRecord.capture(evt, elapsedMillis(startedAt))
-				return true
-			}
+		sender := &eventSender{
+			ctx:            ctx,
+			logger:         logger,
+			conversationID: input.ConversationID,
+			events:         events,
+			record:         runRecord,
+			startedAt:      startedAt,
 		}
 
 		state := &runState{
@@ -140,7 +128,7 @@ func (a *Agent) Run(ctx context.Context, input agent.Input) (<-chan event.Event,
 			references:      make([]tool.SearchResult, 0),
 		}
 		a.saveRunQuestion(ctx, logger, input, runRecord)
-		if !a.run(ctx, send, logger, input, cfg, state) {
+		if !a.run(ctx, sender.send, logger, input, cfg, state) {
 			return
 		}
 		logger.Info("\U0001F3C1 Plan-Execute Agent 已完成",
