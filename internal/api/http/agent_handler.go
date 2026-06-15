@@ -17,24 +17,40 @@ import (
 type AgentHandler struct {
 	// logger 是 HTTP 入口日志，ChatStream 会基于它派生 request_id 维度的 logger。
 	logger *slog.Logger
-	// agent 是实际处理请求的流式 Agent，目前由 websearch.ReactAgent 实现。
-	agent agent.Agent
+	// agents 保存不同 agentType 对应的流式 Agent。
+	agents map[string]agent.Agent
 	// tasks 管理流式任务生命周期，用于同会话互斥和主动停止生成。
 	tasks *task.Manager
 }
 
 func NewAgentHandler(logger *slog.Logger, chatAgent agent.Agent, tasks *task.Manager) *AgentHandler {
+	return NewAgentHandlerWithAgents(logger, map[string]agent.Agent{"websearch": chatAgent}, tasks)
+}
+
+func NewAgentHandlerWithAgents(logger *slog.Logger, agents map[string]agent.Agent, tasks *task.Manager) *AgentHandler {
 	if tasks == nil {
 		tasks = task.NewManager(logger)
 	}
 	return &AgentHandler{
 		logger: logger,
-		agent:  chatAgent,
+		agents: agents,
 		tasks:  tasks,
 	}
 }
 
 func (h *AgentHandler) ChatStream(w http.ResponseWriter, r *http.Request) {
+	h.streamAgent(w, r, "websearch")
+}
+
+func (h *AgentHandler) DeepStream(w http.ResponseWriter, r *http.Request) {
+	h.streamAgent(w, r, "plan-execute")
+}
+
+func (h *AgentHandler) SkillsStream(w http.ResponseWriter, r *http.Request) {
+	h.streamAgent(w, r, "skills")
+}
+
+func (h *AgentHandler) streamAgent(w http.ResponseWriter, r *http.Request, agentType string) {
 	startedAt := time.Now()
 	requestID := newRequestID()
 	logger := h.logger.With("request_id", requestID)
@@ -53,18 +69,26 @@ func (h *AgentHandler) ChatStream(w http.ResponseWriter, r *http.Request) {
 		WriteSSEEvent(w, event.Error("BAD_REQUEST", "conversationId is required", "missing conversationId parameter"))
 		return
 	}
+	currentAgent, ok := h.agents[agentType]
+	if !ok || currentAgent == nil {
+		logger.Error("\U0000274C Agent 未注册", "agent_type", agentType)
+		WriteSSEEvent(w, event.Error("AGENT_NOT_FOUND", "agent is not registered", agentType))
+		return
+	}
 
 	logger.Info("\U0001F680 聊天流请求已接收",
 		"conversation_id", conversationID,
+		"agent_type", agentType,
 		"query", query,
 		"query_chars", len(query),
 		"remote_addr", r.RemoteAddr,
 	)
 
-	taskInfo, err := h.tasks.Register(r.Context(), conversationID, "websearch")
+	taskInfo, err := h.tasks.Register(r.Context(), conversationID, agentType)
 	if err != nil {
 		logger.Warn("\U000026A0 聊天流请求被拒绝：会话已有任务运行",
 			"conversation_id", conversationID,
+			"agent_type", agentType,
 			"elapsed_ms", elapsedMillis(startedAt),
 			"error", err,
 		)
@@ -73,7 +97,7 @@ func (h *AgentHandler) ChatStream(w http.ResponseWriter, r *http.Request) {
 	}
 	defer h.tasks.Remove(taskInfo)
 
-	events, err := h.agent.Run(taskInfo.Context(), agent.Input{
+	events, err := currentAgent.Run(taskInfo.Context(), agent.Input{
 		Query:          query,
 		ConversationID: conversationID,
 		RequestID:      requestID,
@@ -83,6 +107,7 @@ func (h *AgentHandler) ChatStream(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		logger.Error("\U0000274C Agent 流启动失败",
 			"conversation_id", conversationID,
+			"agent_type", agentType,
 			"elapsed_ms", elapsedMillis(startedAt),
 			"error", err,
 		)
@@ -95,6 +120,7 @@ func (h *AgentHandler) ChatStream(w http.ResponseWriter, r *http.Request) {
 
 	logger.Info("\U0001F3C1 聊天流请求已结束",
 		"conversation_id", conversationID,
+		"agent_type", agentType,
 		"event_count", streamSummary.EventCount,
 		"event_text_count", streamSummary.TypeCounts[event.TypeText],
 		"event_thinking_count", streamSummary.TypeCounts[event.TypeThinking],

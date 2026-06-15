@@ -40,6 +40,10 @@ type ReactAgent struct {
 	maxHistoryRecords int
 	// contextPolicy 控制 prompt 上下文预算和历史裁剪。
 	contextPolicy contextx.Policy
+	// agentType 写入 Memory 的 agent_type，也用于日志识别。
+	agentType string
+	// systemPromptBuilder 生成系统提示词。Skills Agent 会复用 ReAct 循环，但替换提示词。
+	systemPromptBuilder func(time.Time) string
 }
 
 // Option 是 ReactAgent 的可选配置入口。
@@ -68,11 +72,34 @@ func New(model model.Model, tools *tool.Registry, logger *slog.Logger, opts ...O
 		memory:            memory.NoopStore{},
 		maxHistoryRecords: 30,
 		contextPolicy:     contextx.DefaultPolicy(),
+		agentType:         "websearch",
+		systemPromptBuilder: func(now time.Time) string {
+			return webSearchPrompt(now)
+		},
 	}
 	for _, opt := range opts {
 		opt(a)
 	}
 	return a
+}
+
+// WithAgentType 设置 Agent 类型，用于日志和会话持久化。
+func WithAgentType(agentType string) Option {
+	return func(a *ReactAgent) {
+		if strings.TrimSpace(agentType) != "" {
+			a.agentType = strings.TrimSpace(agentType)
+		}
+	}
+}
+
+// WithSystemPrompt 设置 ReAct Agent 的系统提示词构造器。
+// Skills Agent 会复用 WebSearch 的 tool_calls 主循环，但使用自己的系统提示词。
+func WithSystemPrompt(builder func(time.Time) string) Option {
+	return func(a *ReactAgent) {
+		if builder != nil {
+			a.systemPromptBuilder = builder
+		}
+	}
 }
 
 // WithMaxRounds 设置最大 ReAct 推理轮数。
@@ -126,7 +153,7 @@ func (a *ReactAgent) runConfig(input agent.Input) runConfig {
 	return cfg
 }
 
-// Run 是 WebSearch ReAct Agent 的外部入口。
+// Run 是 ReAct Agent 的外部入口。
 //
 // 这层只做三件事：
 //  1. 创建一个事件 channel，作为 Agent 到 HTTP SSE 的输出通道。
@@ -148,8 +175,9 @@ func (a *ReactAgent) Run(ctx context.Context, input agent.Input) (<-chan event.E
 		defer a.persistRun(ctx, logger, input, runRecord)
 		runCfg := a.runConfig(input)
 
-		logger.Info("\U0001F916 WebSearch ReAct Agent 已启动",
+		logger.Info("\U0001F916 ReAct Agent 已启动",
 			"conversation_id", input.ConversationID,
+			"agent_type", a.agentType,
 			"query", input.Query,
 			"query_chars", len(input.Query),
 			"max_rounds", runCfg.maxRounds,
@@ -188,7 +216,7 @@ func (a *ReactAgent) Run(ctx context.Context, input agent.Input) (<-chan event.E
 
 		// 初始消息严格对应 Java WebSearchReactAgent：系统提示词 + 包裹在 <question> 中的用户问题。
 		systemMessages := []model.Message{
-			{Role: model.RoleSystem, Content: webSearchPrompt(time.Now())},
+			{Role: model.RoleSystem, Content: a.systemPromptBuilder(time.Now())},
 		}
 		historyMessages := a.loadHistory(ctx, logger, input.ConversationID)
 		currentMessages := []model.Message{{Role: model.RoleUser, Content: "<question>" + input.Query + "</question>"}}
@@ -200,15 +228,17 @@ func (a *ReactAgent) Run(ctx context.Context, input agent.Input) (<-chan event.E
 		// roundState 只存在于单个轮次内；agentState 会一直传到最终输出 reference。
 		state := agentState{searchResults: make([]tool.SearchResult, 0)}
 		if !a.scheduleRounds(ctx, send, input.ConversationID, input.RequestID, runCfg, messages, &state) {
-			logger.Warn("\U000026A0 WebSearch ReAct Agent 未完成即停止",
+			logger.Warn("\U000026A0 ReAct Agent 未完成即停止",
 				"conversation_id", input.ConversationID,
+				"agent_type", a.agentType,
 				"elapsed_ms", elapsedMillis(startedAt),
 				"error", ctx.Err(),
 			)
 			return
 		}
-		logger.Info("\U0001F60A WebSearch ReAct Agent 已完成",
+		logger.Info("\U0001F60A ReAct Agent 已完成",
 			"conversation_id", input.ConversationID,
+			"agent_type", a.agentType,
 			"reference_count", len(state.searchResults),
 			"elapsed_ms", elapsedMillis(startedAt),
 		)
@@ -786,7 +816,7 @@ func (a *ReactAgent) saveRunQuestion(ctx context.Context, logger *slog.Logger, i
 	startedAt := time.Now()
 	saved, err := a.memory.SaveQuestion(ctx, memory.SaveQuestionRequest{
 		SessionID: input.ConversationID,
-		AgentType: "websearch",
+		AgentType: a.agentType,
 		Question:  input.Query,
 	})
 	if err != nil {

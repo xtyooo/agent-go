@@ -40,6 +40,8 @@ type AiSession struct {
 	SessionID string `gorm:"column:session_id;type:varchar(128);not null;index:idx_ai_session_session_create,priority:1"`
 	// AgentType 是智能体类型，例如 websearch。
 	AgentType string `gorm:"column:agent_type;type:varchar(64)"`
+	// SessionName 是前端展示的会话名称，未命名时为空。
+	SessionName string `gorm:"column:session_name;type:varchar(255)"`
 	// Question 是用户问题。
 	Question string `gorm:"column:question;type:mediumtext"`
 	// Answer 是 AI 回复。
@@ -138,9 +140,15 @@ func (s *MySQLStore) FindRecent(ctx context.Context, sessionID string, maxRecord
 }
 
 func (s *MySQLStore) SaveQuestion(ctx context.Context, req SaveQuestionRequest) (SessionRecord, error) {
+	sessionName, err := s.findSessionName(ctx, req.SessionID)
+	if err != nil {
+		return SessionRecord{}, err
+	}
+
 	row := AiSession{
 		SessionID:         req.SessionID,
 		AgentType:         req.AgentType,
+		SessionName:       sessionName,
 		Question:          req.Question,
 		Tools:             req.Tools,
 		FirstResponseTime: req.FirstResponseTime,
@@ -150,6 +158,28 @@ func (s *MySQLStore) SaveQuestion(ctx context.Context, req SaveQuestionRequest) 
 		return SessionRecord{}, fmt.Errorf("insert session question: %w", err)
 	}
 	return row.toRecord(), nil
+}
+
+func (s *MySQLStore) findSessionName(ctx context.Context, sessionID string) (string, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return "", nil
+	}
+
+	var row AiSession
+	err := s.db.WithContext(ctx).
+		Select("session_name").
+		Where("session_id = ? AND session_name <> ''", sessionID).
+		Order("update_time DESC").
+		Order("id DESC").
+		First(&row).Error
+	if err == nil {
+		return row.SessionName, nil
+	}
+	if err == gorm.ErrRecordNotFound {
+		return "", nil
+	}
+	return "", fmt.Errorf("query session name: %w", err)
 }
 
 func (s *MySQLStore) UpdateAnswer(ctx context.Context, req UpdateAnswerRequest) error {
@@ -176,6 +206,148 @@ func (s *MySQLStore) UpdateAnswer(ctx context.Context, req UpdateAnswerRequest) 
 	return nil
 }
 
+func (s *MySQLStore) ListSessions(ctx context.Context, req ListSessionsRequest) ([]SessionSummary, int64, error) {
+	limit := req.Limit
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	offset := req.Offset
+	if offset < 0 {
+		offset = 0
+	}
+
+	var total int64
+	if err := s.sessionListBaseQuery(ctx, req).Distinct("session_id").Count(&total).Error; err != nil {
+		return nil, 0, fmt.Errorf("count sessions: %w", err)
+	}
+	if total == 0 {
+		return []SessionSummary{}, 0, nil
+	}
+
+	type sessionGroup struct {
+		SessionID    string
+		MessageCount int64
+		CreateTime   time.Time
+		UpdateTime   time.Time
+	}
+	var groups []sessionGroup
+	if err := s.sessionListBaseQuery(ctx, req).
+		Select("session_id, COUNT(*) AS message_count, MIN(create_time) AS create_time, MAX(update_time) AS update_time").
+		Group("session_id").
+		Order("update_time DESC").
+		Order("session_id DESC").
+		Limit(limit).
+		Offset(offset).
+		Find(&groups).Error; err != nil {
+		return nil, 0, fmt.Errorf("query sessions: %w", err)
+	}
+
+	summaries := make([]SessionSummary, 0, len(groups))
+	for _, group := range groups {
+		var first AiSession
+		if err := s.db.WithContext(ctx).
+			Where("session_id = ?", group.SessionID).
+			Order("create_time ASC").
+			Order("id ASC").
+			First(&first).Error; err != nil {
+			return nil, 0, fmt.Errorf("query first session record: %w", err)
+		}
+
+		var last AiSession
+		if err := s.db.WithContext(ctx).
+			Where("session_id = ?", group.SessionID).
+			Order("update_time DESC").
+			Order("id DESC").
+			First(&last).Error; err != nil {
+			return nil, 0, fmt.Errorf("query last session record: %w", err)
+		}
+
+		summaries = append(summaries, SessionSummary{
+			SessionID:     group.SessionID,
+			SessionName:   last.SessionName,
+			AgentType:     last.AgentType,
+			FirstQuestion: first.Question,
+			LastQuestion:  last.Question,
+			LastAnswer:    last.Answer,
+			MessageCount:  group.MessageCount,
+			CreateTime:    group.CreateTime,
+			UpdateTime:    group.UpdateTime,
+		})
+	}
+
+	return summaries, total, nil
+}
+
+func (s *MySQLStore) FindBySession(ctx context.Context, sessionID string) ([]SessionRecord, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return nil, nil
+	}
+
+	var rows []AiSession
+	if err := s.db.WithContext(ctx).
+		Where("session_id = ?", sessionID).
+		Order("create_time ASC").
+		Order("id ASC").
+		Find(&rows).Error; err != nil {
+		return nil, fmt.Errorf("query session detail: %w", err)
+	}
+
+	records := make([]SessionRecord, 0, len(rows))
+	for _, row := range rows {
+		records = append(records, row.toRecord())
+	}
+	return records, nil
+}
+
+func (s *MySQLStore) DeleteSession(ctx context.Context, sessionID string) (int64, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return 0, nil
+	}
+
+	result := s.db.WithContext(ctx).Where("session_id = ?", sessionID).Delete(&AiSession{})
+	if result.Error != nil {
+		return 0, fmt.Errorf("delete session: %w", result.Error)
+	}
+	return result.RowsAffected, nil
+}
+
+func (s *MySQLStore) RenameSession(ctx context.Context, sessionID string, name string) (int64, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	name = strings.TrimSpace(name)
+	if sessionID == "" {
+		return 0, nil
+	}
+
+	result := s.db.WithContext(ctx).
+		Model(&AiSession{}).
+		Where("session_id = ?", sessionID).
+		Updates(map[string]any{
+			"session_name": name,
+			"update_time":  time.Now(),
+		})
+	if result.Error != nil {
+		return 0, fmt.Errorf("rename session: %w", result.Error)
+	}
+	return result.RowsAffected, nil
+}
+
+func (s *MySQLStore) sessionListBaseQuery(ctx context.Context, req ListSessionsRequest) *gorm.DB {
+	db := s.db.WithContext(ctx).Model(&AiSession{})
+	if agentType := strings.TrimSpace(req.AgentType); agentType != "" {
+		db = db.Where("agent_type = ?", agentType)
+	}
+	if keyword := strings.TrimSpace(req.Keyword); keyword != "" {
+		like := "%" + keyword + "%"
+		db = db.Where("session_id LIKE ? OR session_name LIKE ? OR question LIKE ?", like, like, like)
+	}
+	return db
+}
+
 func (s *MySQLStore) Close() error {
 	if s == nil || s.sqlDB == nil {
 		return nil
@@ -188,6 +360,7 @@ func (s AiSession) toRecord() SessionRecord {
 		ID:                s.ID,
 		SessionID:         s.SessionID,
 		AgentType:         s.AgentType,
+		SessionName:       s.SessionName,
 		Question:          s.Question,
 		Answer:            s.Answer,
 		Thinking:          s.Thinking,

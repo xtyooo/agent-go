@@ -23,6 +23,8 @@ type Config struct {
 	Context ContextConfig `yaml:"context"`
 	// Tools 保存本地工具所需的外部服务配置。
 	Tools ToolsConfig `yaml:"tools"`
+	// Skills 保存本地技能目录配置，对应 Java dodo-agent 的 skills.directory。
+	Skills SkillsConfig `yaml:"skills"`
 }
 
 // ServerConfig 是 HTTP Server 的启动参数。
@@ -83,6 +85,17 @@ type ToolsConfig struct {
 	Tavily TavilyConfig `yaml:"tavily"`
 }
 
+// SkillsConfig 是本地 Skills Runtime 配置。
+// directory 兼容 Java dodo-agent 的单目录写法；directories 用于 Go 版多目录扫描。
+type SkillsConfig struct {
+	// Directory 是单个技能根目录，每个子目录下包含一个 SKILL.md。
+	Directory string `yaml:"directory"`
+	// Directories 是多个技能根目录。
+	Directories []string `yaml:"directories"`
+	// AutoReload 控制每次读取前是否重新扫描目录，开发调试时建议开启。
+	AutoReload bool `yaml:"auto-reload"`
+}
+
 // TavilyConfig 是 Tavily 搜索工具配置。
 type TavilyConfig struct {
 	// Endpoint 是 Tavily Search API 地址。
@@ -133,6 +146,9 @@ func Default() Config {
 				MaxResults:     5,
 				TimeoutSeconds: 20,
 			},
+		},
+		Skills: SkillsConfig{
+			AutoReload: true,
 		},
 	}
 }
@@ -219,4 +235,30 @@ func (c *Config) normalize() {
 	c.Tools.Tavily.APIKey = strings.TrimSpace(c.Tools.Tavily.APIKey)
 	c.Tools.Tavily.ProjectID = strings.TrimSpace(c.Tools.Tavily.ProjectID)
 	c.Tools.Tavily.SearchDepth = strings.TrimSpace(c.Tools.Tavily.SearchDepth)
+
+	c.Skills.Directory = strings.TrimSpace(c.Skills.Directory)
+	normalizedDirs := make([]string, 0, len(c.Skills.Directories)+1)
+	if c.Skills.Directory != "" {
+		normalizedDirs = append(normalizedDirs, c.Skills.Directory)
+	}
+	for _, dir := range c.Skills.Directories {
+		dir = strings.TrimSpace(dir)
+		if dir != "" {
+			normalizedDirs = append(normalizedDirs, dir)
+		}
+	}
+	c.Skills.Directories = uniqueStrings(normalizedDirs)
+}
+
+func uniqueStrings(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return out
 }

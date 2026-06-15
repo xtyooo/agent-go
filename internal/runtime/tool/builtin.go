@@ -160,15 +160,20 @@ func (t *WebSearchMockTool) Execute(ctx context.Context, input Input) (Result, e
 // 当前只有 web_search 需要访问外部服务，后续新增工具可以继续扩展这里。
 type DefaultRegistryConfig struct {
 	WebSearch WebSearchConfig
+	ReadSkill Tool
 }
 
 func NewDefaultRegistry(cfg DefaultRegistryConfig) (*Registry, error) {
-	return NewRegistry(
+	tools := []Tool{
 		NewTimeTool(),
 		NewWeatherMockTool(),
 		NewWebSearchTool(cfg.WebSearch),
 		NewWebSearchMockTool(),
-	)
+	}
+	if cfg.ReadSkill != nil {
+		tools = append(tools, cfg.ReadSkill)
+	}
+	return NewRegistry(tools...)
 }
 
 func searchSchema() map[string]any {

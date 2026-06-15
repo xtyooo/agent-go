@@ -16,6 +16,8 @@ type SessionRecord struct {
 	SessionID string
 	// AgentType 是 Agent 类型，例如 websearch。
 	AgentType string
+	// SessionName 是前端展示的会话名称，未命名时为空。
+	SessionName string
 	// Question 是用户问题。
 	Question string
 	// Answer 是 AI 最终回复正文。
@@ -62,6 +64,25 @@ type UpdateAnswerRequest struct {
 	TotalResponseTime int64
 }
 
+type ListSessionsRequest struct {
+	AgentType string
+	Keyword   string
+	Limit     int
+	Offset    int
+}
+
+type SessionSummary struct {
+	SessionID     string
+	SessionName   string
+	AgentType     string
+	FirstQuestion string
+	LastQuestion  string
+	LastAnswer    string
+	MessageCount  int64
+	CreateTime    time.Time
+	UpdateTime    time.Time
+}
+
 // Store 是会话记忆运行时的最小接口。
 // Agent 只依赖这里，不直接依赖 MySQL 或具体 SQL。
 type Store interface {
@@ -71,6 +92,10 @@ type Store interface {
 	SaveQuestion(ctx context.Context, req SaveQuestionRequest) (SessionRecord, error)
 	// UpdateAnswer 在流结束时补齐 AI 回答、工具、引用和耗时。
 	UpdateAnswer(ctx context.Context, req UpdateAnswerRequest) error
+	ListSessions(ctx context.Context, req ListSessionsRequest) ([]SessionSummary, int64, error)
+	FindBySession(ctx context.Context, sessionID string) ([]SessionRecord, error)
+	DeleteSession(ctx context.Context, sessionID string) (int64, error)
+	RenameSession(ctx context.Context, sessionID string, name string) (int64, error)
 	// Close 释放底层资源。
 	Close() error
 }
@@ -110,6 +135,22 @@ func (NoopStore) SaveQuestion(ctx context.Context, req SaveQuestionRequest) (Ses
 
 func (NoopStore) UpdateAnswer(ctx context.Context, req UpdateAnswerRequest) error {
 	return nil
+}
+
+func (NoopStore) ListSessions(ctx context.Context, req ListSessionsRequest) ([]SessionSummary, int64, error) {
+	return nil, 0, nil
+}
+
+func (NoopStore) FindBySession(ctx context.Context, sessionID string) ([]SessionRecord, error) {
+	return nil, nil
+}
+
+func (NoopStore) DeleteSession(ctx context.Context, sessionID string) (int64, error) {
+	return 0, nil
+}
+
+func (NoopStore) RenameSession(ctx context.Context, sessionID string, name string) (int64, error) {
+	return 0, nil
 }
 
 func (NoopStore) Close() error {

@@ -11,12 +11,16 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/learn-demo/agent-go/internal/agents/planexecute"
+	"github.com/learn-demo/agent-go/internal/agents/skills"
 	"github.com/learn-demo/agent-go/internal/agents/websearch"
 	httpapi "github.com/learn-demo/agent-go/internal/api/http"
 	"github.com/learn-demo/agent-go/internal/infra/config"
+	"github.com/learn-demo/agent-go/internal/runtime/agent"
 	"github.com/learn-demo/agent-go/internal/runtime/contextx"
 	"github.com/learn-demo/agent-go/internal/runtime/memory"
 	"github.com/learn-demo/agent-go/internal/runtime/model"
+	"github.com/learn-demo/agent-go/internal/runtime/skill"
 	"github.com/learn-demo/agent-go/internal/runtime/task"
 	"github.com/learn-demo/agent-go/internal/runtime/tool"
 )
@@ -46,6 +50,8 @@ func main() {
 		"context_max_history_tokens", cfg.Context.MaxHistoryTokens,
 		"tavily_enabled", cfg.Tools.Tavily.APIKey != "",
 		"tavily_endpoint", cfg.Tools.Tavily.Endpoint,
+		"skills_enabled", len(cfg.Skills.Directories) > 0,
+		"skills_directories", strings.Join(cfg.Skills.Directories, ","),
 	)
 
 	chatModel, err := model.NewOpenAICompatible(model.OpenAIConfig{
@@ -59,6 +65,31 @@ func main() {
 		os.Exit(1)
 	}
 
+	skillManager := skill.NewManager(skill.Config{
+		Directories: cfg.Skills.Directories,
+		AutoReload:  cfg.Skills.AutoReload,
+	}, logger)
+	skillCount := 0
+	if skillManager.Enabled() {
+		loadedSkills, err := skillManager.List(context.Background())
+		if err != nil {
+			logger.Warn("\U000026A0 Skills Runtime 初始化扫描失败，将继续启动但技能不可用", "error", err)
+		} else {
+			skillCount = len(loadedSkills)
+			logger.Info("\U0001F9E9 Skills Runtime 已启用",
+				"skill_count", skillCount,
+				"directories", strings.Join(cfg.Skills.Directories, ","),
+				"auto_reload", cfg.Skills.AutoReload,
+			)
+		}
+	} else {
+		logger.Info("\U0001F9E9 Skills Runtime 未配置目录，read_skill 工具不会注册")
+	}
+
+	var readSkillTool tool.Tool
+	if skillManager.Enabled() {
+		readSkillTool = tool.NewReadSkillTool(skillManager, logger)
+	}
 	tools, err := tool.NewDefaultRegistry(tool.DefaultRegistryConfig{
 		WebSearch: tool.WebSearchConfig{
 			APIKey:      cfg.Tools.Tavily.APIKey,
@@ -68,6 +99,7 @@ func main() {
 			MaxResults:  cfg.Tools.Tavily.MaxResults,
 			Timeout:     time.Duration(cfg.Tools.Tavily.TimeoutSeconds) * time.Second,
 		},
+		ReadSkill: readSkillTool,
 	})
 	if err != nil {
 		logger.Error("\U0000274C 工具运行时配置无效", "error", err)
@@ -77,6 +109,7 @@ func main() {
 		"model", cfg.Model.Name,
 		"tool_count", len(tools.Names()),
 		"tools", strings.Join(tools.Names(), ","),
+		"skill_count", skillCount,
 	)
 
 	memoryStore, err := newMemoryStore(cfg, logger)
@@ -100,11 +133,40 @@ func main() {
 			CharsPerToken:        cfg.Context.CharsPerToken,
 		}),
 	)
+	deepAgent := planexecute.New(chatModel, tools, logger,
+		planexecute.WithMaxRounds(cfg.Agent.MaxRounds),
+		planexecute.WithMemory(memoryStore, cfg.Memory.MaxHistoryRecords),
+		planexecute.WithContextPolicy(contextx.Policy{
+			MaxInputTokens:       cfg.Context.MaxInputTokens,
+			ReservedOutputTokens: cfg.Context.ReservedOutputTokens,
+			MaxHistoryTokens:     cfg.Context.MaxHistoryTokens,
+			CharsPerToken:        cfg.Context.CharsPerToken,
+		}),
+	)
+	skillsAgent := skills.New(chatModel, tools, skillManager, logger,
+		skills.WithMaxRounds(cfg.Agent.MaxRounds),
+		skills.WithMemory(memoryStore, cfg.Memory.MaxHistoryRecords),
+		skills.WithContextPolicy(contextx.Policy{
+			MaxInputTokens:       cfg.Context.MaxInputTokens,
+			ReservedOutputTokens: cfg.Context.ReservedOutputTokens,
+			MaxHistoryTokens:     cfg.Context.MaxHistoryTokens,
+			CharsPerToken:        cfg.Context.CharsPerToken,
+		}),
+	)
+	agents := map[string]agent.Agent{
+		"websearch":    chatAgent,
+		"plan-execute": deepAgent,
+		"skills":       skillsAgent,
+	}
+	logger.Info("\U0001F916 Agent 注册完成",
+		"agent_count", len(agents),
+		"agents", "websearch,plan-execute,skills",
+	)
 	taskManager := task.NewManager(logger)
 
 	server := &http.Server{
 		Addr:              ":" + cfg.Server.Port,
-		Handler:           httpapi.NewRouter(logger, chatAgent, taskManager),
+		Handler:           httpapi.NewRouterWithAgents(logger, agents, taskManager, memoryStore),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
