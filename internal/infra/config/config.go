@@ -19,6 +19,8 @@ type Config struct {
 	Agent AgentConfig `yaml:"agent"`
 	// Memory 保存会话记忆配置。
 	Memory MemoryConfig `yaml:"memory"`
+	// Context 保存模型上下文预算和裁剪策略配置。
+	Context ContextConfig `yaml:"context"`
 	// Tools 保存本地工具所需的外部服务配置。
 	Tools ToolsConfig `yaml:"tools"`
 }
@@ -63,6 +65,18 @@ type MemoryConfig struct {
 	ConnMaxLifetimeSeconds int `yaml:"conn-max-lifetime-seconds"`
 }
 
+// ContextConfig 是模型上下文窗口管理配置。
+type ContextConfig struct {
+	// MaxInputTokens 是本次模型输入最多允许的估算 token 数。
+	MaxInputTokens int `yaml:"max-input-tokens"`
+	// ReservedOutputTokens 是给模型输出预留的 token 数。
+	ReservedOutputTokens int `yaml:"reserved-output-tokens"`
+	// MaxHistoryTokens 是历史消息最多允许占用的估算 token 数。
+	MaxHistoryTokens int `yaml:"max-history-tokens"`
+	// CharsPerToken 是字符到 token 的粗略换算比例。
+	CharsPerToken int `yaml:"chars-per-token"`
+}
+
 // ToolsConfig 聚合所有工具的配置。
 type ToolsConfig struct {
 	// Tavily 是 web_search 工具的 Tavily HTTP API 配置。
@@ -105,6 +119,12 @@ func Default() Config {
 			MaxOpenConns:           10,
 			MaxIdleConns:           5,
 			ConnMaxLifetimeSeconds: 300,
+		},
+		Context: ContextConfig{
+			MaxInputTokens:       12000,
+			ReservedOutputTokens: 2000,
+			MaxHistoryTokens:     4000,
+			CharsPerToken:        4,
 		},
 		Tools: ToolsConfig{
 			Tavily: TavilyConfig{
@@ -165,6 +185,22 @@ func (c *Config) normalize() {
 	}
 	if c.Memory.ConnMaxLifetimeSeconds <= 0 {
 		c.Memory.ConnMaxLifetimeSeconds = 300
+	}
+
+	if c.Context.MaxInputTokens <= 0 {
+		c.Context.MaxInputTokens = 12000
+	}
+	if c.Context.ReservedOutputTokens < 0 {
+		c.Context.ReservedOutputTokens = 0
+	}
+	if c.Context.MaxHistoryTokens <= 0 {
+		c.Context.MaxHistoryTokens = 4000
+	}
+	if c.Context.CharsPerToken <= 0 {
+		c.Context.CharsPerToken = 4
+	}
+	if c.Context.MaxHistoryTokens > c.Context.MaxInputTokens {
+		c.Context.MaxHistoryTokens = c.Context.MaxInputTokens
 	}
 
 	if strings.TrimSpace(c.Tools.Tavily.Endpoint) == "" {

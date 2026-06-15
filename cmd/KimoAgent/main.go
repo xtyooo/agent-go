@@ -14,6 +14,7 @@ import (
 	"github.com/learn-demo/agent-go/internal/agents/websearch"
 	httpapi "github.com/learn-demo/agent-go/internal/api/http"
 	"github.com/learn-demo/agent-go/internal/infra/config"
+	"github.com/learn-demo/agent-go/internal/runtime/contextx"
 	"github.com/learn-demo/agent-go/internal/runtime/memory"
 	"github.com/learn-demo/agent-go/internal/runtime/model"
 	"github.com/learn-demo/agent-go/internal/runtime/task"
@@ -41,6 +42,8 @@ func main() {
 		"agent_max_rounds", cfg.Agent.MaxRounds,
 		"memory_enabled", cfg.Memory.Enabled,
 		"memory_max_history_records", cfg.Memory.MaxHistoryRecords,
+		"context_max_input_tokens", cfg.Context.MaxInputTokens,
+		"context_max_history_tokens", cfg.Context.MaxHistoryTokens,
 		"tavily_enabled", cfg.Tools.Tavily.APIKey != "",
 		"tavily_endpoint", cfg.Tools.Tavily.Endpoint,
 	)
@@ -90,6 +93,12 @@ func main() {
 	chatAgent := websearch.New(chatModel, tools, logger,
 		websearch.WithMaxRounds(cfg.Agent.MaxRounds),
 		websearch.WithMemory(memoryStore, cfg.Memory.MaxHistoryRecords),
+		websearch.WithContextPolicy(contextx.Policy{
+			MaxInputTokens:       cfg.Context.MaxInputTokens,
+			ReservedOutputTokens: cfg.Context.ReservedOutputTokens,
+			MaxHistoryTokens:     cfg.Context.MaxHistoryTokens,
+			CharsPerToken:        cfg.Context.CharsPerToken,
+		}),
 	)
 	taskManager := task.NewManager(logger)
 

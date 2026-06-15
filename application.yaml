@@ -10,13 +10,19 @@ agent:
   max-rounds: 5
 
 memory:
-  enabled: false
-  dsn: "root:password@tcp(127.0.0.1:3306)/agent_go?charset=utf8mb4&parseTime=true&loc=Local"
+  enabled: true
+  dsn: "root:TXj1chRtk05V2O1XWEB6N5K80eFYR8DB!a1@tcp(127.0.0.1:3306)/agent_go?charset=utf8mb4&parseTime=true&loc=Local"
   max-history-records: 30
   auto-migrate: true
   max-open-conns: 10
   max-idle-conns: 5
   conn-max-lifetime-seconds: 300
+
+context:
+  max-input-tokens: 12000
+  reserved-output-tokens: 2000
+  max-history-tokens: 4000
+  chars-per-token: 4
 
 tools:
   tavily:

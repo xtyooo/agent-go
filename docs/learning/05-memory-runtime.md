@@ -26,7 +26,8 @@ Go 侧对应链路：
 ```text
 AgentHandler.ChatStream
 -> ReactAgent.Run
--> appendHistory
+-> loadHistory
+-> contextx.Builder.Build
 -> saveRunQuestion
 -> scheduleRounds
 -> send 捕获 text/thinking/tool/reference

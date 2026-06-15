@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/learn-demo/agent-go/internal/runtime/agent"
+	"github.com/learn-demo/agent-go/internal/runtime/contextx"
 	"github.com/learn-demo/agent-go/internal/runtime/event"
 	"github.com/learn-demo/agent-go/internal/runtime/memory"
 	"github.com/learn-demo/agent-go/internal/runtime/model"
@@ -37,6 +38,8 @@ type ReactAgent struct {
 	memory memory.Store
 	// maxHistoryRecords 控制每次请求最多加载多少条历史问答。
 	maxHistoryRecords int
+	// contextPolicy 控制 prompt 上下文预算和历史裁剪。
+	contextPolicy contextx.Policy
 }
 
 // Option 是 ReactAgent 的可选配置入口。
@@ -64,6 +67,7 @@ func New(model model.Model, tools *tool.Registry, logger *slog.Logger, opts ...O
 		logger:            logger,
 		memory:            memory.NoopStore{},
 		maxHistoryRecords: 30,
+		contextPolicy:     contextx.DefaultPolicy(),
 	}
 	for _, opt := range opts {
 		opt(a)
@@ -91,6 +95,14 @@ func WithMemory(store memory.Store, maxHistoryRecords int) Option {
 		if maxHistoryRecords > 0 {
 			a.maxHistoryRecords = maxHistoryRecords
 		}
+	}
+}
+
+// WithContextPolicy 设置上下文预算策略。
+// 它用于裁剪历史消息，避免长会话无限膨胀。
+func WithContextPolicy(policy contextx.Policy) Option {
+	return func(a *ReactAgent) {
+		a.contextPolicy = policy.Normalize()
 	}
 }
 
@@ -175,11 +187,13 @@ func (a *ReactAgent) Run(ctx context.Context, input agent.Input) (<-chan event.E
 		}
 
 		// 初始消息严格对应 Java WebSearchReactAgent：系统提示词 + 包裹在 <question> 中的用户问题。
-		messages := []model.Message{
+		systemMessages := []model.Message{
 			{Role: model.RoleSystem, Content: webSearchPrompt(time.Now())},
 		}
-		messages = a.appendHistory(ctx, logger, input.ConversationID, messages)
-		messages = append(messages, model.Message{Role: model.RoleUser, Content: "<question>" + input.Query + "</question>"})
+		historyMessages := a.loadHistory(ctx, logger, input.ConversationID)
+		currentMessages := []model.Message{{Role: model.RoleUser, Content: "<question>" + input.Query + "</question>"}}
+		contextResult := a.buildInitialContext(logger, input.ConversationID, systemMessages, historyMessages, currentMessages)
+		messages := contextResult.Messages
 		a.saveRunQuestion(ctx, logger, input, runRecord)
 
 		// agentState 是跨轮次状态，目前主要保存搜索结果。
@@ -692,11 +706,11 @@ func (a *ReactAgent) modelTools() []model.ToolDefinition {
 	return out
 }
 
-// appendHistory 从 Memory Runtime 加载最近问答，并插入到系统提示词之后、当前问题之前。
-// 这对应 Java BaseAgent.loadChatHistory(conversationId, messages, true, true)。
-func (a *ReactAgent) appendHistory(ctx context.Context, logger *slog.Logger, conversationID string, messages []model.Message) []model.Message {
+// loadHistory 从 Memory Runtime 加载最近问答。
+// 真正是否追加到 prompt、保留多少条，由 Context Runtime 统一决定。
+func (a *ReactAgent) loadHistory(ctx context.Context, logger *slog.Logger, conversationID string) []model.Message {
 	if strings.TrimSpace(conversationID) == "" || a.memory == nil || a.maxHistoryRecords <= 0 {
-		return messages
+		return nil
 	}
 
 	startedAt := time.Now()
@@ -708,7 +722,7 @@ func (a *ReactAgent) appendHistory(ctx context.Context, logger *slog.Logger, con
 			"elapsed_ms", elapsedMillis(startedAt),
 			"error", err,
 		)
-		return messages
+		return nil
 	}
 	if len(records) == 0 {
 		logger.Info("\U0001F4DD 未找到可加载的会话历史",
@@ -716,7 +730,7 @@ func (a *ReactAgent) appendHistory(ctx context.Context, logger *slog.Logger, con
 			"max_history_records", a.maxHistoryRecords,
 			"elapsed_ms", elapsedMillis(startedAt),
 		)
-		return messages
+		return nil
 	}
 
 	historyMessages := memory.HistoryMessages(records)
@@ -726,22 +740,42 @@ func (a *ReactAgent) appendHistory(ctx context.Context, logger *slog.Logger, con
 			"record_count", len(records),
 			"elapsed_ms", elapsedMillis(startedAt),
 		)
-		return messages
+		return nil
 	}
 
-	out := make([]model.Message, 0, len(messages)+1+len(historyMessages))
-	out = append(out, messages...)
-	out = append(out, model.Message{Role: model.RoleUser, Content: "对话历史："})
-	out = append(out, historyMessages...)
-
-	logger.Info("\U0001F4DD 会话历史已加载",
+	logger.Info("\U0001F4DD 会话历史已读取",
 		"conversation_id", conversationID,
 		"record_count", len(records),
 		"history_message_count", len(historyMessages),
 		"max_history_records", a.maxHistoryRecords,
 		"elapsed_ms", elapsedMillis(startedAt),
 	)
-	return out
+	return historyMessages
+}
+
+func (a *ReactAgent) buildInitialContext(logger *slog.Logger, conversationID string, systemMessages []model.Message, historyMessages []model.Message, currentMessages []model.Message) contextx.BuildResult {
+	builder := contextx.NewBuilder(a.contextPolicy)
+	result := builder.Build(
+		contextx.Section{Name: contextx.SectionSystem, Messages: systemMessages},
+		contextx.Section{Name: contextx.SectionHistory, Messages: historyMessages},
+		contextx.Section{Name: contextx.SectionCurrent, Messages: currentMessages},
+	)
+	summary := result.Summary
+	logger.Info("\U0001F9EE 上下文预算已应用",
+		"conversation_id", conversationID,
+		"message_count", len(result.Messages),
+		"input_token_estimate", summary.InputTokenEstimate,
+		"max_input_tokens", summary.Policy.MaxInputTokens,
+		"reserved_output_tokens", summary.Policy.ReservedOutputTokens,
+		"system_token_estimate", summary.SystemTokenEstimate,
+		"history_token_estimate", summary.HistoryTokenEstimate,
+		"history_token_before_trim", summary.HistoryTokenBeforeTrim,
+		"history_message_input", summary.HistoryMessageInput,
+		"history_message_kept", summary.HistoryMessageKept,
+		"history_message_dropped", summary.HistoryMessageDropped,
+		"current_token_estimate", summary.CurrentTokenEstimate,
+	)
+	return result
 }
 
 func (a *ReactAgent) saveRunQuestion(ctx context.Context, logger *slog.Logger, input agent.Input, record *runRecord) {
