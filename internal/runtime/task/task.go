@@ -138,33 +138,35 @@ func (m *Manager) Remove(info *Info) {
 // 当 Stop 被调用时，这里会向原 SSE 输出一条停止提示并补 complete，然后关闭输出通道。
 func (m *Manager) WrapEvents(info *Info, source <-chan event.Event) <-chan event.Event {
 	out := make(chan event.Event)
-	go func() {
-		defer close(out)
+	go m.forwardEvents(info, source, out)
+	return out
+}
 
-		for {
+func (m *Manager) forwardEvents(info *Info, source <-chan event.Event, out chan<- event.Event) {
+	defer close(out)
+
+	for {
+		select {
+		case <-info.stopCh:
+			sendStopEvents(context.Background(), out)
+			return
+		case <-info.ctx.Done():
+			if info.stopped.Load() {
+				sendStopEvents(context.Background(), out)
+			}
+			return
+		case evt, ok := <-source:
+			if !ok {
+				return
+			}
 			select {
 			case <-info.stopCh:
 				sendStopEvents(context.Background(), out)
 				return
-			case <-info.ctx.Done():
-				if info.stopped.Load() {
-					sendStopEvents(context.Background(), out)
-				}
-				return
-			case evt, ok := <-source:
-				if !ok {
-					return
-				}
-				select {
-				case <-info.stopCh:
-					sendStopEvents(context.Background(), out)
-					return
-				case out <- evt:
-				}
+			case out <- evt:
 			}
 		}
-	}()
-	return out
+	}
 }
 
 // Context 返回任务 context。Agent 必须使用这个 context 调用模型和工具。

@@ -62,96 +62,86 @@ func (a *ChatAgent) Run(ctx context.Context, input Input) (<-chan event.Event, e
 	// events 是 Agent 对外暴露的唯一数据通道。
 	// 调用方只能读，不能写；这能避免 HTTP 层反向污染 Agent 内部状态。
 	events := make(chan event.Event)
+	go a.runAsync(ctx, input, events)
+	return events, nil
+}
 
-	// 模型流和工具执行都可能阻塞，所以放到 goroutine 中运行。
-	// Run 本身快速返回 channel，让 HTTP handler 可以马上开始写 SSE 响应头。
-	go func() {
-		defer close(events)
-		logger := slog.Default()
-		if input.RequestID != "" {
-			logger = logger.With("request_id", input.RequestID)
-		}
-		if input.ConversationID != "" {
-			logger = logger.With("conversation_id", input.ConversationID)
-		}
+func (a *ChatAgent) runAsync(ctx context.Context, input Input, events chan event.Event) {
+	defer close(events)
+	logger := slog.Default()
+	if input.RequestID != "" {
+		logger = logger.With("request_id", input.RequestID)
+	}
+	if input.ConversationID != "" {
+		logger = logger.With("conversation_id", input.ConversationID)
+	}
 
-		// send 是普通 ChatAgent 的唯一事件出口；客户端取消时停止后续模型或工具工作。
-		send := func(evt event.Event) bool {
-			select {
-			case <-ctx.Done():
-				return false
-			case events <- evt:
-				return true
-			}
-		}
-
-		if !send(event.Thinking("Preparing Agent Runtime...\n")) {
+	sender := event.NewSender(event.SenderConfig{Ctx: ctx, Out: events})
+	send := sender.Send
+	if !send(event.Thinking("Preparing Agent Runtime...\n")) {
+		return
+	}
+	if a.tools != nil {
+		if !send(event.Recommend("Available tools loaded", a.tools.Definitions())) {
 			return
 		}
-		if a.tools != nil {
-			if !send(event.Recommend("Available tools loaded", a.tools.Definitions())) {
-				return
-			}
-		}
+	}
 
-		// 这是 Milestone 早期的简单工具规划：用关键词决定是否调用一个工具。
-		// WebSearch ReactAgent 已经改为模型原生 tool_calls，这里保留用于学习对比。
-		if call, ok := a.planToolCall(input.Query); ok {
-			if !a.runToolCall(ctx, send, logger, call) {
-				return
-			}
+	// 这是 Milestone 早期的简单工具规划：用关键词决定是否调用一个工具。
+	// WebSearch ReactAgent 已经改为模型原生 tool_calls，这里保留用于学习对比。
+	if call, ok := a.planToolCall(input.Query); ok {
+		if !a.runToolCall(ctx, send, logger, call) {
+			return
+		}
+		_ = send(event.Complete())
+		return
+	}
+
+	if !send(event.Thinking("Calling Model Runtime...\n")) {
+		return
+	}
+
+	// 没有命中本地工具规划时，直接把问题交给模型流式回答。
+	// 这里不传 tools schema，因此模型不会返回 tool_calls，只会返回普通文本 chunk。
+	stream, err := a.model.Stream(ctx, model.Request{
+		Temperature: 0.7,
+		Messages: []model.Message{
+			{
+				Role:    model.RoleSystem,
+				Content: "You are an assistant for learning Agent Runtime. Answer directly and clearly, with emphasis on runtime boundaries.",
+			},
+			{
+				Role:    model.RoleUser,
+				Content: input.Query,
+			},
+		},
+		RequestID: input.RequestID,
+	})
+	if err != nil {
+		_ = send(event.Error("MODEL_START_FAILED", "model stream failed to start", err.Error()))
+		return
+	}
+
+	// 模型层已经把 HTTP SSE 的 data 行、JSON delta、DONE 标记等细节封装成 StreamChunk。
+	// ChatAgent 只需要把正文 chunk.Content 转成 text 事件，并在 Done 时补 complete。
+	for chunk := range stream {
+		if chunk.Err != nil {
+			_ = send(event.Error("MODEL_STREAM_FAILED", "model stream failed", chunk.Err.Error()))
+			return
+		}
+		if chunk.Done {
 			_ = send(event.Complete())
 			return
 		}
-
-		if !send(event.Thinking("Calling Model Runtime...\n")) {
+		if chunk.Content == "" {
+			continue
+		}
+		if !send(event.Text(chunk.Content)) {
 			return
 		}
+	}
 
-		// 没有命中本地工具规划时，直接把问题交给模型流式回答。
-		// 这里不传 tools schema，因此模型不会返回 tool_calls，只会返回普通文本 chunk。
-		stream, err := a.model.Stream(ctx, model.Request{
-			Temperature: 0.7,
-			Messages: []model.Message{
-				{
-					Role:    model.RoleSystem,
-					Content: "You are an assistant for learning Agent Runtime. Answer directly and clearly, with emphasis on runtime boundaries.",
-				},
-				{
-					Role:    model.RoleUser,
-					Content: input.Query,
-				},
-			},
-			RequestID: input.RequestID,
-		})
-		if err != nil {
-			_ = send(event.Error("MODEL_START_FAILED", "model stream failed to start", err.Error()))
-			return
-		}
-
-		// 模型层已经把 HTTP SSE 的 data 行、JSON delta、DONE 标记等细节封装成 StreamChunk。
-		// ChatAgent 只需要把正文 chunk.Content 转成 text 事件，并在 Done 时补 complete。
-		for chunk := range stream {
-			if chunk.Err != nil {
-				_ = send(event.Error("MODEL_STREAM_FAILED", "model stream failed", chunk.Err.Error()))
-				return
-			}
-			if chunk.Done {
-				_ = send(event.Complete())
-				return
-			}
-			if chunk.Content == "" {
-				continue
-			}
-			if !send(event.Text(chunk.Content)) {
-				return
-			}
-		}
-
-		_ = send(event.Complete())
-	}()
-
-	return events, nil
+	_ = send(event.Complete())
 }
 
 type plannedToolCall struct {

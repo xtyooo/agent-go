@@ -163,88 +163,68 @@ func (a *ReactAgent) runConfig(input agent.Input) runConfig {
 // 这里不要直接调用模型或工具；真正的 ReAct 轮次控制在 scheduleRounds 中完成。
 func (a *ReactAgent) Run(ctx context.Context, input agent.Input) (<-chan event.Event, error) {
 	events := make(chan event.Event, 16)
-
-	go func() {
-		defer close(events)
-		startedAt := time.Now()
-		runRecord := newRunRecord(input.ConversationID, input.Query, startedAt)
-		logger := a.logger
-		if input.RequestID != "" {
-			logger = logger.With("request_id", input.RequestID)
-		}
-		defer a.persistRun(ctx, logger, input, runRecord)
-		runCfg := a.runConfig(input)
-
-		logger.Info("\U0001F916 ReAct Agent 已启动",
-			"conversation_id", input.ConversationID,
-			"agent_type", a.agentType,
-			"query", input.Query,
-			"query_chars", len(input.Query),
-			"max_rounds", runCfg.maxRounds,
-			"temperature", runCfg.temperature,
-		)
-
-		// send 是 Agent 内部唯一的事件出口。
-		// 所有 thinking/text/tool/reference/complete 都必须经过这里发给 HTTP SSE。
-		// 如果客户端断开，request context 会取消，send 返回 false，Agent 立即停止后续工作。
-		send := func(evt event.Event) bool {
-			select {
-			case <-ctx.Done():
-				logger.Warn("\U0001F6D1 Agent 事件发送被取消",
-					"conversation_id", input.ConversationID,
-					"event_type", evt.Type,
-					"elapsed_ms", elapsedMillis(startedAt),
-					"error", ctx.Err(),
-				)
-				return false
-			default:
-			}
-			select {
-			case <-ctx.Done():
-				logger.Warn("\U0001F6D1 Agent 事件发送被取消",
-					"conversation_id", input.ConversationID,
-					"event_type", evt.Type,
-					"elapsed_ms", elapsedMillis(startedAt),
-					"error", ctx.Err(),
-				)
-				return false
-			case events <- evt:
-				runRecord.capture(evt, elapsedMillis(startedAt))
-				return true
-			}
-		}
-
-		// 初始消息严格对应 Java WebSearchReactAgent：系统提示词 + 包裹在 <question> 中的用户问题。
-		systemMessages := []model.Message{
-			{Role: model.RoleSystem, Content: a.systemPromptBuilder(time.Now())},
-		}
-		historyMessages := a.loadHistory(ctx, logger, input.ConversationID)
-		currentMessages := []model.Message{{Role: model.RoleUser, Content: "<question>" + input.Query + "</question>"}}
-		contextResult := a.buildInitialContext(logger, input.ConversationID, systemMessages, historyMessages, currentMessages)
-		messages := contextResult.Messages
-		a.saveRunQuestion(ctx, logger, input, runRecord)
-
-		// agentState 是跨轮次状态，目前主要保存搜索结果。
-		// roundState 只存在于单个轮次内；agentState 会一直传到最终输出 reference。
-		state := agentState{searchResults: make([]tool.SearchResult, 0)}
-		if !a.scheduleRounds(ctx, send, input.ConversationID, input.RequestID, runCfg, messages, &state) {
-			logger.Warn("\U000026A0 ReAct Agent 未完成即停止",
-				"conversation_id", input.ConversationID,
-				"agent_type", a.agentType,
-				"elapsed_ms", elapsedMillis(startedAt),
-				"error", ctx.Err(),
-			)
-			return
-		}
-		logger.Info("\U0001F60A ReAct Agent 已完成",
-			"conversation_id", input.ConversationID,
-			"agent_type", a.agentType,
-			"reference_count", len(state.searchResults),
-			"elapsed_ms", elapsedMillis(startedAt),
-		)
-	}()
-
+	go a.runAsync(ctx, input, events)
 	return events, nil
+}
+
+func (a *ReactAgent) runAsync(ctx context.Context, input agent.Input, events chan event.Event) {
+	defer close(events)
+	startedAt := time.Now()
+	runRecord := newRunRecord(input.ConversationID, input.Query, startedAt)
+	logger := a.logger
+	if input.RequestID != "" {
+		logger = logger.With("request_id", input.RequestID)
+	}
+	defer a.persistRun(ctx, logger, input, runRecord)
+	runCfg := a.runConfig(input)
+
+	logger.Info("\U0001F916 ReAct Agent 已启动",
+		"conversation_id", input.ConversationID,
+		"agent_type", a.agentType,
+		"query", input.Query,
+		"query_chars", len(input.Query),
+		"max_rounds", runCfg.maxRounds,
+		"temperature", runCfg.temperature,
+	)
+
+	sender := event.NewSender(event.SenderConfig{
+		Ctx:            ctx,
+		Out:            events,
+		Logger:         logger,
+		ConversationID: input.ConversationID,
+		Elapsed:        func() int64 { return elapsedMillis(startedAt) },
+		Capture:        runRecord.capture,
+		CancelMessage:  "🛑 Agent 事件发送被取消",
+	})
+
+	// 初始消息严格对应 Java WebSearchReactAgent：系统提示词 + 包裹在 <question> 中的用户问题。
+	systemMessages := []model.Message{
+		{Role: model.RoleSystem, Content: a.systemPromptBuilder(time.Now())},
+	}
+	historyMessages := a.loadHistory(ctx, logger, input.ConversationID)
+	currentMessages := []model.Message{{Role: model.RoleUser, Content: "<question>" + input.Query + "</question>"}}
+	contextResult := a.buildInitialContext(logger, input.ConversationID, systemMessages, historyMessages, currentMessages)
+	messages := contextResult.Messages
+	a.saveRunQuestion(ctx, logger, input, runRecord)
+
+	// agentState 是跨轮次状态，目前主要保存搜索结果。
+	// roundState 只存在于单个轮次内；agentState 会一直传到最终输出 reference。
+	state := agentState{searchResults: make([]tool.SearchResult, 0)}
+	if !a.scheduleRounds(ctx, sender.Send, input.ConversationID, input.RequestID, runCfg, messages, &state) {
+		logger.Warn("\U000026A0 ReAct Agent 未完成即停止",
+			"conversation_id", input.ConversationID,
+			"agent_type", a.agentType,
+			"elapsed_ms", elapsedMillis(startedAt),
+			"error", ctx.Err(),
+		)
+		return
+	}
+	logger.Info("\U0001F60A ReAct Agent 已完成",
+		"conversation_id", input.ConversationID,
+		"agent_type", a.agentType,
+		"reference_count", len(state.searchResults),
+		"elapsed_ms", elapsedMillis(startedAt),
+	)
 }
 
 // scheduleRounds 是 ReAct 主循环，对应 Java WebSearchReactAgent 的 scheduleRound + finishRound。

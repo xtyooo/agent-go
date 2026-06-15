@@ -170,13 +170,7 @@ func main() {
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
-	go func() {
-		logger.Info("\U0001F680 KimoAgent 服务启动中", "addr", server.Addr)
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logger.Error("\U0000274C 服务启动失败", "error", err)
-			os.Exit(1)
-		}
-	}()
+	go serveHTTP(server, logger)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -195,6 +189,13 @@ func main() {
 	logger.Info("\U00002705 服务已停止")
 }
 
+func serveHTTP(server *http.Server, logger *slog.Logger) {
+	logger.Info("\U0001F680 KimoAgent 服务启动中", "addr", server.Addr)
+	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		logger.Error("\U0000274C 服务启动失败", "error", err)
+		os.Exit(1)
+	}
+}
 func newMemoryStore(cfg config.Config, logger *slog.Logger) (memory.Store, error) {
 	if !cfg.Memory.Enabled {
 		logger.Info("\U0001F4DD Memory Runtime 未启用，跳过会话持久化")

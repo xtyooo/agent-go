@@ -206,111 +206,101 @@ func (m *OpenAICompatible) Stream(ctx context.Context, req Request) (<-chan Chun
 	// 返回 channel 后，真正读取 resp.Body 的工作在 goroutine 中进行；
 	// 这对应 Java Reactor stream 的异步数据流。
 	chunks := make(chan Chunk)
-	go func() {
-		defer close(chunks)
-		defer resp.Body.Close()
-		headersMs := elapsedMillis(startedAt)
+	go m.streamChunks(ctx, logger, resp, chunks, startedAt)
 
-		logger.Info("\U0001F4E5 模型流 Scanner 已开始读取响应体",
-			"model", m.model,
-			"status", resp.StatusCode,
-			"buffer_max_bytes", 1024*1024,
-			"model_http_headers_ms", headersMs,
-		)
+	return chunks, nil
+}
 
-		// Scanner 按行读取 SSE。模型平台一般输出形如：data: {...}\n\n。
-		scanner := bufio.NewScanner(resp.Body)
-		// 默认 Scanner token 上限太小，工具参数或长文本 chunk 可能超过 64K。
-		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+func (m *OpenAICompatible) streamChunks(ctx context.Context, logger *slog.Logger, resp *http.Response, chunks chan<- Chunk, startedAt time.Time) {
+	defer close(chunks)
+	defer resp.Body.Close()
+	headersMs := elapsedMillis(startedAt)
 
-		lineCount := 0
-		dataLineCount := 0
-		emptyLineCount := 0
-		commentLineCount := 0
-		contentChunkCount := 0
-		contentChars := 0
-		toolDeltaCount := 0
-		firstChunkMs := int64(-1)
+	logger.Info("\U0001F4E5 模型流 Scanner 已开始读取响应体",
+		"model", m.model,
+		"status", resp.StatusCode,
+		"buffer_max_bytes", 1024*1024,
+		"model_http_headers_ms", headersMs,
+	)
 
-		for scanner.Scan() {
-			line := strings.TrimSpace(scanner.Text())
-			lineCount++
-			if line == "" || strings.HasPrefix(line, ":") {
-				if line == "" {
-					emptyLineCount++
-				} else {
-					commentLineCount++
-				}
-				continue
-			}
-			if !strings.HasPrefix(line, "data:") {
-				continue
-			}
+	// Scanner 按行读取 SSE。模型平台一般输出形如：data: {...}\n\n。
+	scanner := bufio.NewScanner(resp.Body)
+	// 默认 Scanner token 上限太小，工具参数或长文本 chunk 可能超过 64K。
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
-			dataLineCount++
-			data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-			if data == "[DONE]" {
-				logger.Info("\U00002705 模型流 Scanner 读取完成，已收到 DONE 标记",
-					"model", m.model,
-					"line_count", lineCount,
-					"data_line_count", dataLineCount,
-					"empty_line_count", emptyLineCount,
-					"comment_line_count", commentLineCount,
-					"content_chunk_count", contentChunkCount,
-					"content_chars", contentChars,
-					"tool_delta_count", toolDeltaCount,
-					"model_http_headers_ms", headersMs,
-					"first_model_chunk_ms", firstChunkMs,
-					"elapsed_ms", elapsedMillis(startedAt),
-				)
-				sendChunk(ctx, chunks, Chunk{Done: true})
-				return
-			}
+	lineCount := 0
+	dataLineCount := 0
+	emptyLineCount := 0
+	commentLineCount := 0
+	contentChunkCount := 0
+	contentChars := 0
+	toolDeltaCount := 0
+	firstChunkMs := int64(-1)
 
-			// data 行只负责拆出一个模型 delta；tool_call arguments 的跨 chunk 合并交给 Agent roundState。
-			chunk, err := parseStreamChunk([]byte(data))
-			if err != nil {
-				logger.Error("\U0000274C 模型流 chunk 解析失败",
-					"model", m.model,
-					"line_count", lineCount,
-					"data_line_count", dataLineCount,
-					"data_chars", len(data),
-					"elapsed_ms", elapsedMillis(startedAt),
-					"error", err,
-				)
-				sendChunk(ctx, chunks, Chunk{Err: fmt.Errorf("parse model stream chunk: %w", err)})
-				return
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		lineCount++
+		if line == "" || strings.HasPrefix(line, ":") {
+			if line == "" {
+				emptyLineCount++
+			} else {
+				commentLineCount++
 			}
-			if chunk.Content == "" && len(chunk.ToolCalls) == 0 {
-				continue
-			}
-			if firstChunkMs < 0 {
-				firstChunkMs = elapsedMillis(startedAt)
-			}
-			if chunk.Content != "" {
-				contentChunkCount++
-				contentChars += len(chunk.Content)
-			}
-			if len(chunk.ToolCalls) > 0 {
-				toolDeltaCount += len(chunk.ToolCalls)
-			}
-			if !sendChunk(ctx, chunks, chunk) {
-				logger.Warn("\U0001F6D1 模型流下游消费者已取消",
-					"model", m.model,
-					"line_count", lineCount,
-					"data_line_count", dataLineCount,
-					"content_chunk_count", contentChunkCount,
-					"content_chars", contentChars,
-					"tool_delta_count", toolDeltaCount,
-					"elapsed_ms", elapsedMillis(startedAt),
-					"error", ctx.Err(),
-				)
-				return
-			}
+			continue
+		}
+		if !strings.HasPrefix(line, "data:") {
+			continue
 		}
 
-		if err := scanner.Err(); err != nil {
-			logger.Error("\U0000274C 模型流 Scanner 读取失败",
+		dataLineCount++
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if data == "[DONE]" {
+			logger.Info("\U00002705 模型流 Scanner 读取完成，已收到 DONE 标记",
+				"model", m.model,
+				"line_count", lineCount,
+				"data_line_count", dataLineCount,
+				"empty_line_count", emptyLineCount,
+				"comment_line_count", commentLineCount,
+				"content_chunk_count", contentChunkCount,
+				"content_chars", contentChars,
+				"tool_delta_count", toolDeltaCount,
+				"model_http_headers_ms", headersMs,
+				"first_model_chunk_ms", firstChunkMs,
+				"elapsed_ms", elapsedMillis(startedAt),
+			)
+			sendChunk(ctx, chunks, Chunk{Done: true})
+			return
+		}
+
+		// data 行只负责拆出一个模型 delta；tool_call arguments 的跨 chunk 合并交给 Agent roundState。
+		chunk, err := parseStreamChunk([]byte(data))
+		if err != nil {
+			logger.Error("\U0000274C 模型流 chunk 解析失败",
+				"model", m.model,
+				"line_count", lineCount,
+				"data_line_count", dataLineCount,
+				"data_chars", len(data),
+				"elapsed_ms", elapsedMillis(startedAt),
+				"error", err,
+			)
+			sendChunk(ctx, chunks, Chunk{Err: fmt.Errorf("parse model stream chunk: %w", err)})
+			return
+		}
+		if chunk.Content == "" && len(chunk.ToolCalls) == 0 {
+			continue
+		}
+		if firstChunkMs < 0 {
+			firstChunkMs = elapsedMillis(startedAt)
+		}
+		if chunk.Content != "" {
+			contentChunkCount++
+			contentChars += len(chunk.Content)
+		}
+		if len(chunk.ToolCalls) > 0 {
+			toolDeltaCount += len(chunk.ToolCalls)
+		}
+		if !sendChunk(ctx, chunks, chunk) {
+			logger.Warn("\U0001F6D1 模型流下游消费者已取消",
 				"model", m.model,
 				"line_count", lineCount,
 				"data_line_count", dataLineCount,
@@ -318,26 +308,38 @@ func (m *OpenAICompatible) Stream(ctx context.Context, req Request) (<-chan Chun
 				"content_chars", contentChars,
 				"tool_delta_count", toolDeltaCount,
 				"elapsed_ms", elapsedMillis(startedAt),
-				"error", err,
+				"error", ctx.Err(),
 			)
-			sendChunk(ctx, chunks, Chunk{Err: fmt.Errorf("read model stream: %w", err)})
 			return
 		}
+	}
 
-		logger.Warn("\U000026A0 模型流结束但未收到 DONE 标记",
+	if err := scanner.Err(); err != nil {
+		logger.Error("\U0000274C 模型流 Scanner 读取失败",
 			"model", m.model,
 			"line_count", lineCount,
 			"data_line_count", dataLineCount,
 			"content_chunk_count", contentChunkCount,
 			"content_chars", contentChars,
 			"tool_delta_count", toolDeltaCount,
-			"model_http_headers_ms", headersMs,
-			"first_model_chunk_ms", firstChunkMs,
 			"elapsed_ms", elapsedMillis(startedAt),
+			"error", err,
 		)
-	}()
+		sendChunk(ctx, chunks, Chunk{Err: fmt.Errorf("read model stream: %w", err)})
+		return
+	}
 
-	return chunks, nil
+	logger.Warn("\U000026A0 模型流结束但未收到 DONE 标记",
+		"model", m.model,
+		"line_count", lineCount,
+		"data_line_count", dataLineCount,
+		"content_chunk_count", contentChunkCount,
+		"content_chars", contentChars,
+		"tool_delta_count", toolDeltaCount,
+		"model_http_headers_ms", headersMs,
+		"first_model_chunk_ms", firstChunkMs,
+		"elapsed_ms", elapsedMillis(startedAt),
+	)
 }
 
 func sendChunk(ctx context.Context, out chan<- Chunk, chunk Chunk) bool {

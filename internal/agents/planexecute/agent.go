@@ -94,52 +94,55 @@ func WithContextPolicy(policy contextx.Policy) Option {
 
 func (a *Agent) Run(ctx context.Context, input agent.Input) (<-chan event.Event, error) {
 	events := make(chan event.Event, 16)
-	go func() {
-		defer close(events)
-		startedAt := time.Now()
-		runRecord := newRunRecord(input.ConversationID, input.Query, startedAt)
-		logger := a.logger
-		if input.RequestID != "" {
-			logger = logger.With("request_id", input.RequestID)
-		}
-		defer a.persistRun(ctx, logger, input, runRecord)
-		cfg := a.runConfig(input)
-
-		logger.Info("\U0001F9ED Plan-Execute Agent 已启动",
-			"conversation_id", input.ConversationID,
-			"query", input.Query,
-			"query_chars", len(input.Query),
-			"max_rounds", cfg.maxRounds,
-			"temperature", cfg.temperature,
-		)
-
-		sender := &eventSender{
-			ctx:            ctx,
-			logger:         logger,
-			conversationID: input.ConversationID,
-			events:         events,
-			record:         runRecord,
-			startedAt:      startedAt,
-		}
-
-		state := &runState{
-			question:        input.Query,
-			historyMessages: a.loadHistory(ctx, logger, input.ConversationID),
-			references:      make([]tool.SearchResult, 0),
-		}
-		a.saveRunQuestion(ctx, logger, input, runRecord)
-		if !a.run(ctx, sender.send, logger, input, cfg, state) {
-			return
-		}
-		logger.Info("\U0001F3C1 Plan-Execute Agent 已完成",
-			"conversation_id", input.ConversationID,
-			"round_count", state.round,
-			"task_count", len(state.results),
-			"reference_count", len(state.references),
-			"elapsed_ms", elapsedMillis(startedAt),
-		)
-	}()
+	go a.runAsync(ctx, input, events)
 	return events, nil
+}
+
+func (a *Agent) runAsync(ctx context.Context, input agent.Input, events chan event.Event) {
+	defer close(events)
+	startedAt := time.Now()
+	runRecord := newRunRecord(input.ConversationID, input.Query, startedAt)
+	logger := a.logger
+	if input.RequestID != "" {
+		logger = logger.With("request_id", input.RequestID)
+	}
+	defer a.persistRun(ctx, logger, input, runRecord)
+	cfg := a.runConfig(input)
+
+	logger.Info("\U0001F9ED Plan-Execute Agent 已启动",
+		"conversation_id", input.ConversationID,
+		"query", input.Query,
+		"query_chars", len(input.Query),
+		"max_rounds", cfg.maxRounds,
+		"temperature", cfg.temperature,
+	)
+
+	sender := event.NewSender(event.SenderConfig{
+		Ctx:            ctx,
+		Out:            events,
+		Logger:         logger,
+		ConversationID: input.ConversationID,
+		Elapsed:        func() int64 { return elapsedMillis(startedAt) },
+		Capture:        runRecord.capture,
+		CancelMessage:  "🛑 Plan-Execute 事件发送被取消",
+	})
+
+	state := &runState{
+		question:        input.Query,
+		historyMessages: a.loadHistory(ctx, logger, input.ConversationID),
+		references:      make([]tool.SearchResult, 0),
+	}
+	a.saveRunQuestion(ctx, logger, input, runRecord)
+	if !a.run(ctx, sender.Send, logger, input, cfg, state) {
+		return
+	}
+	logger.Info("\U0001F3C1 Plan-Execute Agent 已完成",
+		"conversation_id", input.ConversationID,
+		"round_count", state.round,
+		"task_count", len(state.results),
+		"reference_count", len(state.references),
+		"elapsed_ms", elapsedMillis(startedAt),
+	)
 }
 
 type runConfig struct {
