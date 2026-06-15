@@ -1,6 +1,7 @@
 # Milestone 5 Memory Runtime
 
 本阶段复刻 Java dodo-agent 中 `BaseAgent + ChatMemory + AiSessionService` 的最小闭环。
+当前持久化实现使用 `GORM + MySQL`，更接近 Java 原项目 `MyBatis-Plus` 的开发体验。
 
 ## 这个模块解决什么问题
 
@@ -45,7 +46,8 @@ type Store interface {
 }
 ```
 
-`ReactAgent` 只依赖这个接口，不直接依赖 MySQL。
+`ReactAgent` 只依赖这个接口，不直接依赖 MySQL 或 GORM。
+GORM 被限制在 `internal/runtime/memory` 的存储实现里。
 
 ## 配置方式
 
@@ -70,13 +72,13 @@ CREATE DATABASE IF NOT EXISTS agent_go
   DEFAULT COLLATE utf8mb4_unicode_ci;
 ```
 
-`auto-migrate: true` 时，服务启动会自动创建 `ai_session` 表。
+`auto-migrate: true` 时，服务启动会通过 GORM `AutoMigrate` 自动创建或补齐 `ai_session` 表。
 
 ## 和其他模块的边界
 
 - HTTP 层只负责传入 `conversationId`，不关心数据库。
 - Agent 层负责决定什么时候加载历史、什么时候保存结果。
-- Memory 层只负责持久化和查询，不理解 ReAct 轮次。
+- Memory 层只负责持久化和查询，不理解 ReAct 轮次；GORM 也只停留在这一层。
 - Model 层不知道历史来自哪里，只接收最终拼好的 `messages`。
 
 ## 当前实现和 Java 的差异
@@ -86,6 +88,7 @@ CREATE DATABASE IF NOT EXISTS agent_go
 - Go 版没有把 tool role message 保存为历史，只保存用户问题和最终回答。这和 Java `createPersistentChatMemory` 一致。
 - Go 版和 Java 一样，先加载历史，再保存当前问题，避免当前问题被重复塞进本轮 prompt。
 - Go 版保存回答发生在 Agent goroutine 退出时，对齐 Java `doFinally` 的收口语义。
+- Go 版底层使用 GORM，不使用 MyBatis-Plus；但 model 字段和表名对齐 Java `AiSession`。
 
 ## 验证方式
 

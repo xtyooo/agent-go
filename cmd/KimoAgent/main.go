@@ -16,6 +16,7 @@ import (
 	"github.com/learn-demo/agent-go/internal/infra/config"
 	"github.com/learn-demo/agent-go/internal/runtime/memory"
 	"github.com/learn-demo/agent-go/internal/runtime/model"
+	"github.com/learn-demo/agent-go/internal/runtime/task"
 	"github.com/learn-demo/agent-go/internal/runtime/tool"
 )
 
@@ -90,10 +91,11 @@ func main() {
 		websearch.WithMaxRounds(cfg.Agent.MaxRounds),
 		websearch.WithMemory(memoryStore, cfg.Memory.MaxHistoryRecords),
 	)
+	taskManager := task.NewManager(logger)
 
 	server := &http.Server{
 		Addr:              ":" + cfg.Server.Port,
-		Handler:           httpapi.NewRouter(logger, chatAgent),
+		Handler:           httpapi.NewRouter(logger, chatAgent, taskManager),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 

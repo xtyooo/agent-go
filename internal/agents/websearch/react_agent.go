@@ -123,7 +123,7 @@ func (a *ReactAgent) runConfig(input agent.Input) runConfig {
 //
 // 这里不要直接调用模型或工具；真正的 ReAct 轮次控制在 scheduleRounds 中完成。
 func (a *ReactAgent) Run(ctx context.Context, input agent.Input) (<-chan event.Event, error) {
-	events := make(chan event.Event)
+	events := make(chan event.Event, 16)
 
 	go func() {
 		defer close(events)
@@ -148,7 +148,17 @@ func (a *ReactAgent) Run(ctx context.Context, input agent.Input) (<-chan event.E
 		// 所有 thinking/text/tool/reference/complete 都必须经过这里发给 HTTP SSE。
 		// 如果客户端断开，request context 会取消，send 返回 false，Agent 立即停止后续工作。
 		send := func(evt event.Event) bool {
-			runRecord.capture(evt, elapsedMillis(startedAt))
+			select {
+			case <-ctx.Done():
+				logger.Warn("\U0001F6D1 Agent 事件发送被取消",
+					"conversation_id", input.ConversationID,
+					"event_type", evt.Type,
+					"elapsed_ms", elapsedMillis(startedAt),
+					"error", ctx.Err(),
+				)
+				return false
+			default:
+			}
 			select {
 			case <-ctx.Done():
 				logger.Warn("\U0001F6D1 Agent 事件发送被取消",
@@ -159,6 +169,7 @@ func (a *ReactAgent) Run(ctx context.Context, input agent.Input) (<-chan event.E
 				)
 				return false
 			case events <- evt:
+				runRecord.capture(evt, elapsedMillis(startedAt))
 				return true
 			}
 		}

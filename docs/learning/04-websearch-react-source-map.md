@@ -55,7 +55,7 @@ cmd/KimoAgent/main.go
 当前差异：
 
 - Go 版已经补入最小 `Memory Runtime + MySQL ai_session`，用于加载最近历史和保存问答结果；会话列表/删除接口后续再补。
-- Go 版还没有 `AgentTaskManager` 的 conversationId 互斥和 `/agent/stop`，属于 Milestone 6。
+- Go 版已经补入单机版 `AgentTaskManager`，支持 conversationId 互斥、客户端断开取消和 `/agent/stop` 主动停止；Redis 分布式停止后续再补。
 
 ## Agent Loop Mapping
 
@@ -171,6 +171,6 @@ event.Reference(tool.MustJSON(results), len(results))
 这些差异保留到后续里程碑：
 
 - Memory：Java 会保存 question/answer/thinking/tools/reference/recommend；Go 暂未持久化。
-- Task：Java 有 `AgentTaskManager`、Redis、Disposable 取消；Go 暂未实现。
+- Task：Go 已实现单机 `AgentTaskManager`，用 `context.CancelFunc` 替代 Java Reactor `Disposable`；Redis 分布式停止暂未实现。
 - Tavily：Java 通过 MCP 初始化 `ToolCallback`；Go 当前先用 Tavily HTTP API 和 mock fallback。
 - Recommendations：Java 默认生成推荐问题；Go 版等 Memory/推荐上下文完善后补齐。

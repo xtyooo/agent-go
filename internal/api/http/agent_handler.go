@@ -3,6 +3,7 @@ package http
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/learn-demo/agent-go/internal/runtime/agent"
 	"github.com/learn-demo/agent-go/internal/runtime/event"
+	"github.com/learn-demo/agent-go/internal/runtime/task"
 )
 
 type AgentHandler struct {
@@ -17,12 +19,18 @@ type AgentHandler struct {
 	logger *slog.Logger
 	// agent 是实际处理请求的流式 Agent，目前由 websearch.ReactAgent 实现。
 	agent agent.Agent
+	// tasks 管理流式任务生命周期，用于同会话互斥和主动停止生成。
+	tasks *task.Manager
 }
 
-func NewAgentHandler(logger *slog.Logger, chatAgent agent.Agent) *AgentHandler {
+func NewAgentHandler(logger *slog.Logger, chatAgent agent.Agent, tasks *task.Manager) *AgentHandler {
+	if tasks == nil {
+		tasks = task.NewManager(logger)
+	}
 	return &AgentHandler{
 		logger: logger,
 		agent:  chatAgent,
+		tasks:  tasks,
 	}
 }
 
@@ -53,7 +61,19 @@ func (h *AgentHandler) ChatStream(w http.ResponseWriter, r *http.Request) {
 		"remote_addr", r.RemoteAddr,
 	)
 
-	events, err := h.agent.Run(r.Context(), agent.Input{
+	taskInfo, err := h.tasks.Register(r.Context(), conversationID, "websearch")
+	if err != nil {
+		logger.Warn("\U000026A0 聊天流请求被拒绝：会话已有任务运行",
+			"conversation_id", conversationID,
+			"elapsed_ms", elapsedMillis(startedAt),
+			"error", err,
+		)
+		WriteSSEEvent(w, event.Error("TASK_ALREADY_RUNNING", "该会话正在执行中，请稍后再试", err.Error()))
+		return
+	}
+	defer h.tasks.Remove(taskInfo)
+
+	events, err := h.agent.Run(taskInfo.Context(), agent.Input{
 		Query:          query,
 		ConversationID: conversationID,
 		RequestID:      requestID,
@@ -69,6 +89,7 @@ func (h *AgentHandler) ChatStream(w http.ResponseWriter, r *http.Request) {
 		WriteSSEEvent(w, event.Error("AGENT_START_FAILED", "agent failed to start", err.Error()))
 		return
 	}
+	events = h.tasks.WrapEvents(taskInfo, events)
 
 	streamSummary := StreamEvents(w, r, events, logger, conversationID, requestID)
 
@@ -85,6 +106,40 @@ func (h *AgentHandler) ChatStream(w http.ResponseWriter, r *http.Request) {
 		"first_event_ms", streamSummary.FirstEventMs,
 		"elapsed_ms", elapsedMillis(startedAt),
 	)
+}
+
+func (h *AgentHandler) StopAgent(w http.ResponseWriter, r *http.Request) {
+	startedAt := time.Now()
+	requestID := newRequestID()
+	logger := h.logger.With("request_id", requestID)
+	conversationID := r.URL.Query().Get("conversationId")
+	if conversationID == "" {
+		logger.Warn("\U000026A0 停止任务请求被拒绝：缺少 conversationId 参数", "remote_addr", r.RemoteAddr)
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"success": false,
+			"message": "conversationId is required",
+		})
+		return
+	}
+
+	success := h.tasks.Stop(conversationID)
+	status := http.StatusOK
+	message := "任务停止信号已发送"
+	if !success {
+		status = http.StatusNotFound
+		message = "未找到运行中的任务"
+	}
+
+	logger.Info("\U0001F6D1 停止任务请求已处理",
+		"conversation_id", conversationID,
+		"success", success,
+		"elapsed_ms", elapsedMillis(startedAt),
+	)
+	writeJSON(w, status, map[string]any{
+		"success":        success,
+		"conversationId": conversationID,
+		"message":        message,
+	})
 }
 
 func parseFloatQuery(r *http.Request, name string) (float64, bool) {
@@ -116,6 +171,14 @@ func temperaturePtr(value float64, ok bool) *float64 {
 		return nil
 	}
 	return &value
+}
+
+func writeJSON(w http.ResponseWriter, status int, value any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	if err := json.NewEncoder(w).Encode(value); err != nil {
+		_, _ = w.Write([]byte(`{"success":false,"message":"encode response failed"}`))
+	}
 }
 
 func newRequestID() string {
