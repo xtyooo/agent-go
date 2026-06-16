@@ -188,13 +188,19 @@ func (a *ReactAgent) runAsync(ctx context.Context, input agent.Input, events cha
 	)
 
 	sender := event.NewSender(event.SenderConfig{
-		Ctx:            ctx,
-		Out:            events,
-		Logger:         logger,
-		ConversationID: input.ConversationID,
-		Elapsed:        func() int64 { return elapsedMillis(startedAt) },
-		Capture:        runRecord.capture,
-		CancelMessage:  "🛑 Agent 事件发送被取消",
+		Ctx: ctx,
+		Out: events,
+		OnCancel: func(evt event.Event, err error) {
+			logger.Warn("🛑 Agent 事件发送被取消",
+				"conversation_id", input.ConversationID,
+				"event_type", evt.Type,
+				"elapsed_ms", elapsedMillis(startedAt),
+				"error", err,
+			)
+		},
+		AfterSend: func(evt event.Event) {
+			runRecord.capture(evt, elapsedMillis(startedAt))
+		},
 	})
 
 	// 初始消息严格对应 Java WebSearchReactAgent：系统提示词 + 包裹在 <question> 中的用户问题。

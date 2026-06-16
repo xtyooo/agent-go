@@ -118,13 +118,19 @@ func (a *Agent) runAsync(ctx context.Context, input agent.Input, events chan eve
 	)
 
 	sender := event.NewSender(event.SenderConfig{
-		Ctx:            ctx,
-		Out:            events,
-		Logger:         logger,
-		ConversationID: input.ConversationID,
-		Elapsed:        func() int64 { return elapsedMillis(startedAt) },
-		Capture:        runRecord.capture,
-		CancelMessage:  "🛑 Plan-Execute 事件发送被取消",
+		Ctx: ctx,
+		Out: events,
+		OnCancel: func(evt event.Event, err error) {
+			logger.Warn("🛑 Plan-Execute 事件发送被取消",
+				"conversation_id", input.ConversationID,
+				"event_type", evt.Type,
+				"elapsed_ms", elapsedMillis(startedAt),
+				"error", err,
+			)
+		},
+		AfterSend: func(evt event.Event) {
+			runRecord.capture(evt, elapsedMillis(startedAt))
+		},
 	})
 
 	state := &runState{
