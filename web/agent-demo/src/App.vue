@@ -70,11 +70,11 @@
         <div v-else-if="!sessions.length" class="empty-state compact">还没有保存的会话</div>
       </div>
 
-      <div class="sidebar-footer">
-        <span class="user-dot">YA</span>
+      <div v-if="currentUser" class="sidebar-footer">
+        <span class="user-dot">{{ currentUser.initials }}</span>
         <span>
-          <strong>杨胜鑫</strong>
-          <small>Plus</small>
+          <strong>{{ currentUser.name }}</strong>
+          <small>{{ currentUser.plan }}</small>
         </span>
       </div>
     </aside>
@@ -138,14 +138,25 @@
             </div>
 
             <div v-if="message.role === 'assistant' && message.process?.length" class="process-list">
-              <details v-for="item in message.process" :key="item.id" :open="item.status === 'running'">
-                <summary>
-                  <span :class="['process-dot', item.status]"></span>
-                  {{ item.title }}
-                  <small>{{ item.meta }}</small>
-                </summary>
-                <pre v-if="item.detail">{{ item.detail }}</pre>
-              </details>
+              <div
+                v-for="item in message.process"
+                :key="item.id"
+                class="process-card"
+                :class="[item.kind, item.status, { open: isProcessExpanded(item) }]"
+              >
+                <button
+                  class="process-summary"
+                  type="button"
+                  :aria-expanded="isProcessExpanded(item)"
+                  @click="toggleProcess(item)"
+                >
+                  <span v-if="item.kind !== 'thinking'" :class="['process-dot', item.status]"></span>
+                  <span class="process-title">{{ processTitle(item) }}</span>
+                  <small v-if="processMeta(item)">{{ processMeta(item) }}</small>
+                  <ChevronDown class="process-chevron" :size="14" />
+                </button>
+                <div v-if="item.detail && isProcessExpanded(item)" class="process-detail">{{ item.detail }}</div>
+              </div>
             </div>
 
             <div v-if="message.content" class="markdown-body" v-html="renderMarkdown(message.content)"></div>
@@ -378,6 +389,7 @@ const agentPickerOpen = ref(false);
 const sessions = ref([]);
 const sessionsLoading = ref(false);
 const sessionError = ref("");
+const currentUser = ref(null);
 const sessionKeyword = ref("");
 const activeConversationId = ref("");
 const activeSessionTitle = ref("");
@@ -438,11 +450,21 @@ async function loadSessions(options = {}) {
     sessions.value = payload.items;
   } catch (error) {
     if (!silent) {
-      sessionError.value = "历史会话暂不可用";
+      sessionError.value = sessionErrorMessage(error);
     }
   } finally {
     if (!silent) sessionsLoading.value = false;
   }
+}
+
+function sessionErrorMessage(error) {
+  if (error?.status === 405) {
+    return "后端会话接口未启用";
+  }
+  if (error?.status === 404) {
+    return "后端未提供历史会话";
+  }
+  return "历史会话暂不可用";
 }
 
 async function openSession(sessionId) {
@@ -490,18 +512,20 @@ function historicalProcess(record) {
   if (record.thinking) {
     process.push({
       id: `thinking-${record.id}`,
-      title: "思考过程",
+      kind: "thinking",
+      title: "已思考",
       status: "success",
-      meta: "历史记录",
+      meta: "已完成",
       detail: record.thinking
     });
   }
   if (record.tools) {
     process.push({
       id: `tools-${record.id}`,
-      title: "使用工具",
+      kind: "tool",
+      title: "工具调用",
       status: "success",
-      meta: record.tools,
+      meta: "已完成",
       detail: record.tools
     });
   }
@@ -559,6 +583,28 @@ function closeOverlays() {
 function useStarterPrompt(prompt) {
   draft.value = prompt;
   focusComposer();
+}
+
+function isProcessExpanded(item) {
+  return item.expanded ?? item.status === "running";
+}
+
+function toggleProcess(item) {
+  item.expanded = !isProcessExpanded(item);
+}
+
+function processTitle(item) {
+  if (item.kind === "thinking") {
+    return item.status === "running" ? "思考中" : "已思考";
+  }
+  return item.title;
+}
+
+function processMeta(item) {
+  if (item.kind === "thinking") {
+    return "";
+  }
+  return item.meta;
 }
 
 async function sendMessage() {
@@ -640,13 +686,7 @@ function handleStreamEvent(event) {
   }
 
   if (event.type === "thinking") {
-    assistant.process.push({
-      id: typedEvent.id,
-      title: "思考过程",
-      status: "running",
-      meta: formatDateTime(event.time),
-      detail: event.content || "正在分析"
-    });
+    appendThinkingProcess(assistant, typedEvent);
     return;
   }
 
@@ -657,7 +697,8 @@ function handleStreamEvent(event) {
     }
     assistant.process.push({
       id: processId,
-      title: `调用工具：${event.toolName || "unknown"}`,
+      kind: "tool",
+      title: `使用工具：${event.toolName || "unknown"}`,
       status: "running",
       meta: "执行中",
       detail: event.arguments || ""
@@ -675,7 +716,8 @@ function handleStreamEvent(event) {
     } else {
       assistant.process.push({
         id,
-        title: `工具完成：${event.toolName || "unknown"}`,
+        kind: "tool",
+        title: `使用工具：${event.toolName || "unknown"}`,
         status: "success",
         meta: "已完成",
         detail: event.result || event.content || ""
@@ -691,6 +733,7 @@ function handleStreamEvent(event) {
     assistant.references = parseReferences(event.content);
     assistant.process.push({
       id: typedEvent.id,
+      kind: "reference",
       title: "引用资料",
       status: "success",
       meta: event.count ? `${event.count} 条` : "",
@@ -702,6 +745,7 @@ function handleStreamEvent(event) {
   if (event.type === "recommend") {
     assistant.process.push({
       id: typedEvent.id,
+      kind: "recommend",
       title: "推荐问题",
       status: "success",
       meta: "",
@@ -718,6 +762,33 @@ function handleStreamEvent(event) {
   if (event.type === "complete") {
       finishRun();
   }
+}
+
+function appendThinkingProcess(assistant, event) {
+  const content = event.content || "";
+  if (!content) return;
+
+  let item = assistant.process.find((process) => process.kind === "thinking");
+  if (!item) {
+    item = {
+      id: `thinking-${assistant.id}`,
+      kind: "thinking",
+      title: "思考中",
+      status: "running",
+      meta: "正在运行",
+      detail: ""
+    };
+    assistant.process.unshift(item);
+  }
+
+  item.status = "running";
+  item.meta = "正在运行";
+  item.detail = appendProcessDetail(item.detail, content);
+}
+
+function appendProcessDetail(current, next) {
+  if (!current) return next.trimStart();
+  return current + next;
 }
 
 async function stopRun() {

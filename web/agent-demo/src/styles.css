@@ -243,7 +243,7 @@ summary {
 .message-scroll::-webkit-scrollbar,
 .event-log::-webkit-scrollbar,
 .markdown-body pre::-webkit-scrollbar,
-.process-list pre::-webkit-scrollbar {
+.process-detail::-webkit-scrollbar {
   width: 9px;
   height: 9px;
 }
@@ -252,7 +252,7 @@ summary {
 .message-scroll::-webkit-scrollbar-thumb,
 .event-log::-webkit-scrollbar-thumb,
 .markdown-body pre::-webkit-scrollbar-thumb,
-.process-list pre::-webkit-scrollbar-thumb {
+.process-detail::-webkit-scrollbar-thumb {
   border: 2px solid transparent;
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.18);
@@ -555,47 +555,114 @@ summary {
 .process-list {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  margin-bottom: 14px;
+  gap: 6px;
+  align-items: flex-start;
+  margin: 0 0 12px;
 }
 
-.process-list details {
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  background: var(--surface);
+.process-card {
+  width: min(100%, 640px);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 10px;
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.025);
 }
 
-.process-list summary {
+.process-card.thinking {
+  width: auto;
+  max-width: 100%;
+  border-color: transparent;
+  border-radius: 0;
+  background: transparent;
+}
+
+.process-summary {
   display: flex;
   align-items: center;
   gap: 8px;
-  min-height: 38px;
-  padding: 0 12px;
+  width: 100%;
+  min-height: 34px;
+  padding: 0 10px;
   cursor: pointer;
   color: var(--muted);
+  background: transparent;
   font-size: 13px;
-  list-style: none;
+  text-align: left;
+  transition:
+    color 160ms ease,
+    background-color 160ms ease;
 }
 
-.process-list summary::-webkit-details-marker {
-  display: none;
+.process-summary:hover {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.035);
 }
 
-.process-list summary small {
+.process-card.thinking .process-summary {
+  width: auto;
+  min-height: 28px;
+  padding: 0;
+  color: var(--subtle);
+}
+
+.process-card.thinking .process-summary:hover {
+  color: #d7d7d8;
+  background: transparent;
+}
+
+.process-summary small {
   margin-left: auto;
   color: var(--subtle);
 }
 
-.process-list pre {
+.process-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.process-chevron {
+  flex: 0 0 auto;
+  color: var(--faint);
+  transition: transform 160ms ease;
+}
+
+.process-card.thinking .process-chevron {
+  color: inherit;
+}
+
+.process-card.open .process-chevron {
+  transform: rotate(180deg);
+}
+
+.process-detail {
   overflow: auto;
-  max-height: 260px;
+  max-height: 280px;
   margin: 0;
-  border-top: 1px solid var(--border);
-  padding: 12px;
-  color: #d4d4d5;
-  background: #151618;
+  border-top: 1px solid rgba(255, 255, 255, 0.07);
+  padding: 12px 14px 13px;
+  color: #c5c5c7;
+  background: rgba(12, 13, 14, 0.72);
   white-space: pre-wrap;
   word-break: break-word;
+  line-height: 1.7;
+  font-family:
+    "JetBrains Mono", Consolas, "SFMono-Regular", ui-monospace, monospace;
+  font-size: 12.5px;
+}
+
+.process-card.thinking .process-detail {
+  max-height: 220px;
+  margin-top: 4px;
+  border-top: 0;
+  border-left: 2px solid rgba(255, 255, 255, 0.12);
+  padding: 4px 0 4px 12px;
+  color: #a9aaad;
+  background: transparent;
+  font-family: inherit;
+  font-size: 14px;
+  line-height: 1.72;
 }
 
 .process-dot {

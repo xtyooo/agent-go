@@ -96,7 +96,10 @@ async function requestJSON(url, options = {}) {
 
   if (!response.ok || payload?.success === false) {
     const message = payload?.message || `${response.status} ${response.statusText}`.trim();
-    throw new Error(message || "请求失败");
+    const error = new Error(message || "请求失败");
+    error.status = response.status;
+    error.payload = payload;
+    throw error;
   }
   return payload || {};
 }
