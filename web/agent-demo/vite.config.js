@@ -4,7 +4,9 @@ import vue from "@vitejs/plugin-vue";
 const apiTarget = process.env.KIMO_API_TARGET || "http://127.0.0.1:8888";
 const proxy = {
   "/agent": apiTarget,
+  "/pptx": apiTarget,
   "/session": apiTarget,
+  "/trace": apiTarget,
   "/healthz": apiTarget
 };
 

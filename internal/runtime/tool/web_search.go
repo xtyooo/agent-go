@@ -11,6 +11,8 @@ import (
 	"time"
 )
 
+const tavilyMaxQueryChars = 400
+
 type WebSearchTool struct {
 	// apiKey 是 Tavily API 密钥；为空时降级到 mock 搜索。
 	apiKey string
@@ -92,7 +94,8 @@ func (t *WebSearchTool) Definition() Definition {
 }
 
 func (t *WebSearchTool) Execute(ctx context.Context, input Input) (Result, error) {
-	query := StringArg(input.Arguments, "query")
+	originalQuery := StringArg(input.Arguments, "query")
+	query := normalizeSearchQuery(originalQuery, tavilyMaxQueryChars)
 	if query == "" {
 		return Result{}, fmt.Errorf("query is required")
 	}
@@ -151,11 +154,12 @@ func (t *WebSearchTool) Execute(ctx context.Context, input Input) (Result, error
 		Name:    "web_search",
 		Content: formatSearchContent(decoded.Answer, results),
 		Data: map[string]any{
-			"provider":   "tavily",
-			"query":      query,
-			"answer":     decoded.Answer,
-			"results":    results,
-			"request_id": decoded.RequestID,
+			"provider":        "tavily",
+			"query":           query,
+			"query_truncated": query != strings.TrimSpace(originalQuery),
+			"answer":          decoded.Answer,
+			"results":         results,
+			"request_id":      decoded.RequestID,
 		},
 	}, nil
 }
@@ -208,6 +212,18 @@ func emptyFallback(value, fallback string) string {
 		return fallback
 	}
 	return value
+}
+
+func normalizeSearchQuery(query string, maxChars int) string {
+	query = strings.Join(strings.Fields(strings.TrimSpace(query)), " ")
+	if maxChars <= 0 {
+		return query
+	}
+	runes := []rune(query)
+	if len(runes) <= maxChars {
+		return query
+	}
+	return strings.TrimSpace(string(runes[:maxChars]))
 }
 
 func (t *WebSearchTool) fallbackResult(ctx context.Context, input Input, reason string) (Result, error) {

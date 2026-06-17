@@ -159,8 +159,9 @@ func (t *WebSearchMockTool) Execute(ctx context.Context, input Input) (Result, e
 // DefaultRegistryConfig 是默认工具集的外部配置。
 // 当前只有 web_search 需要访问外部服务，后续新增工具可以继续扩展这里。
 type DefaultRegistryConfig struct {
-	WebSearch WebSearchConfig
-	ReadSkill Tool
+	WebSearch  WebSearchConfig
+	ReadSkill  Tool
+	ExtraTools []Tool
 }
 
 func NewDefaultRegistry(cfg DefaultRegistryConfig) (*Registry, error) {
@@ -173,6 +174,7 @@ func NewDefaultRegistry(cfg DefaultRegistryConfig) (*Registry, error) {
 	if cfg.ReadSkill != nil {
 		tools = append(tools, cfg.ReadSkill)
 	}
+	tools = append(tools, cfg.ExtraTools...)
 	return NewRegistry(tools...)
 }
 

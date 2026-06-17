@@ -7,11 +7,13 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/learn-demo/agent-go/internal/runtime/agent"
 	"github.com/learn-demo/agent-go/internal/runtime/event"
 	"github.com/learn-demo/agent-go/internal/runtime/task"
+	"github.com/learn-demo/agent-go/internal/runtime/trace"
 )
 
 type AgentHandler struct {
@@ -21,6 +23,8 @@ type AgentHandler struct {
 	agents map[string]agent.Agent
 	// tasks 管理流式任务生命周期，用于同会话互斥和主动停止生成。
 	tasks *task.Manager
+	// traces 记录 Agent SSE 事件，支持失败排查和离线 replay。
+	traces trace.Store
 }
 
 func NewAgentHandler(logger *slog.Logger, chatAgent agent.Agent, tasks *task.Manager) *AgentHandler {
@@ -28,6 +32,10 @@ func NewAgentHandler(logger *slog.Logger, chatAgent agent.Agent, tasks *task.Man
 }
 
 func NewAgentHandlerWithAgents(logger *slog.Logger, agents map[string]agent.Agent, tasks *task.Manager) *AgentHandler {
+	return NewAgentHandlerWithAgentsAndTrace(logger, agents, tasks, nil)
+}
+
+func NewAgentHandlerWithAgentsAndTrace(logger *slog.Logger, agents map[string]agent.Agent, tasks *task.Manager, traces trace.Store) *AgentHandler {
 	if tasks == nil {
 		tasks = task.NewManager(logger)
 	}
@@ -35,6 +43,7 @@ func NewAgentHandlerWithAgents(logger *slog.Logger, agents map[string]agent.Agen
 		logger: logger,
 		agents: agents,
 		tasks:  tasks,
+		traces: traces,
 	}
 }
 
@@ -50,10 +59,15 @@ func (h *AgentHandler) SkillsStream(w http.ResponseWriter, r *http.Request) {
 	h.streamAgent(w, r, "skills")
 }
 
+func (h *AgentHandler) PptxStream(w http.ResponseWriter, r *http.Request) {
+	h.streamAgent(w, r, "pptx")
+}
+
 func (h *AgentHandler) streamAgent(w http.ResponseWriter, r *http.Request, agentType string) {
 	startedAt := time.Now()
 	requestID := newRequestID()
-	logger := h.logger.With("request_id", requestID)
+	traceID := requestTraceID(r)
+	logger := h.logger.With("request_id", requestID, "trace_id", traceID)
 	query := r.URL.Query().Get("query")
 	conversationID := r.URL.Query().Get("conversationId")
 	temperature, hasTemperature := parseFloatQuery(r, "temperature")
@@ -84,6 +98,24 @@ func (h *AgentHandler) streamAgent(w http.ResponseWriter, r *http.Request, agent
 		"remote_addr", r.RemoteAddr,
 	)
 
+	recorder, err := h.startTrace(r, trace.RunMeta{
+		TraceID:        traceID,
+		RequestID:      requestID,
+		ConversationID: conversationID,
+		AgentType:      agentType,
+		Query:          query,
+		RemoteAddr:     r.RemoteAddr,
+		StartedAt:      startedAt,
+	})
+	if err != nil {
+		logger.Warn("⚠ Agent Trace 启动失败，将继续执行但无法回放",
+			"conversation_id", conversationID,
+			"agent_type", agentType,
+			"error", err,
+		)
+		recorder = nil
+	}
+
 	taskInfo, err := h.tasks.Register(r.Context(), conversationID, agentType)
 	if err != nil {
 		logger.Warn("\U000026A0 聊天流请求被拒绝：会话已有任务运行",
@@ -92,7 +124,12 @@ func (h *AgentHandler) streamAgent(w http.ResponseWriter, r *http.Request, agent
 			"elapsed_ms", elapsedMillis(startedAt),
 			"error", err,
 		)
-		WriteSSEEvent(w, event.Error("TASK_ALREADY_RUNNING", "该会话正在执行中，请稍后再试", err.Error()))
+		errorEvent := event.Error("TASK_ALREADY_RUNNING", "该会话正在执行中，请稍后再试", err.Error())
+		WriteSSEEvent(w, errorEvent)
+		if recorder != nil {
+			recorder.Record(errorEvent)
+		}
+		h.finishTrace(logger, recorder, "failed", err)
 		return
 	}
 	defer h.tasks.Remove(taskInfo)
@@ -111,12 +148,28 @@ func (h *AgentHandler) streamAgent(w http.ResponseWriter, r *http.Request, agent
 			"elapsed_ms", elapsedMillis(startedAt),
 			"error", err,
 		)
-		WriteSSEEvent(w, event.Error("AGENT_START_FAILED", "agent failed to start", err.Error()))
+		errorEvent := event.Error("AGENT_START_FAILED", "agent failed to start", err.Error())
+		WriteSSEEvent(w, errorEvent)
+		if recorder != nil {
+			recorder.Record(errorEvent)
+		}
+		h.finishTrace(logger, recorder, "failed", err)
 		return
 	}
 	events = h.tasks.WrapEvents(taskInfo, events)
 
-	streamSummary := StreamEvents(w, r, events, logger, conversationID, requestID)
+	streamSummary := StreamEventsWithOptions(w, r, events, logger, conversationID, requestID, StreamOptions{
+		Observer: func(evt event.Event) {
+			if recorder != nil {
+				recorder.Record(evt)
+			}
+		},
+	})
+	traceStatus := "completed"
+	if r.Context().Err() != nil {
+		traceStatus = "cancelled"
+	}
+	h.finishTrace(logger, recorder, traceStatus, r.Context().Err())
 
 	logger.Info("\U0001F3C1 聊天流请求已结束",
 		"conversation_id", conversationID,
@@ -131,6 +184,36 @@ func (h *AgentHandler) streamAgent(w http.ResponseWriter, r *http.Request, agent
 		"event_complete_count", streamSummary.TypeCounts[event.TypeComplete],
 		"first_event_ms", streamSummary.FirstEventMs,
 		"elapsed_ms", elapsedMillis(startedAt),
+	)
+}
+
+func (h *AgentHandler) startTrace(r *http.Request, meta trace.RunMeta) (*trace.Recorder, error) {
+	if h.traces == nil {
+		return nil, nil
+	}
+	return h.traces.Start(r.Context(), meta)
+}
+
+func (h *AgentHandler) finishTrace(logger *slog.Logger, recorder *trace.Recorder, status string, finishErr error) {
+	if recorder == nil || !recorder.Enabled() {
+		return
+	}
+	summary, err := recorder.Finish(status, finishErr)
+	if err != nil {
+		logger.Warn("⚠ Agent Trace 保存失败",
+			"trace_id", recorder.TraceID(),
+			"status", status,
+			"error", err,
+		)
+		return
+	}
+	logger.Info("📊 Agent Trace 摘要",
+		"trace_id", summary.TraceID,
+		"status", summary.Status,
+		"event_count", summary.EventCount,
+		"first_event_ms", summary.FirstEventMs,
+		"elapsed_ms", summary.ElapsedMs,
+		"file", summary.FilePath,
 	)
 }
 
@@ -213,4 +296,35 @@ func newRequestID() string {
 		return time.Now().Format("20060102150405.000000000")
 	}
 	return hex.EncodeToString(b[:])
+}
+
+func requestTraceID(r *http.Request) string {
+	if r == nil {
+		return trace.NewID()
+	}
+	if value := safeURLID(r.URL.Query().Get("traceId")); value != "" {
+		return value
+	}
+	return trace.NewID()
+}
+
+func safeURLID(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	var b strings.Builder
+	for _, char := range value {
+		switch {
+		case char >= 'a' && char <= 'z':
+			b.WriteRune(char)
+		case char >= 'A' && char <= 'Z':
+			b.WriteRune(char)
+		case char >= '0' && char <= '9':
+			b.WriteRune(char)
+		case char == '-' || char == '_':
+			b.WriteRune(char)
+		}
+	}
+	return b.String()
 }

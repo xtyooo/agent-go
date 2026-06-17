@@ -9,9 +9,11 @@ import (
 	"strings"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/learn-demo/agent-go/internal/agents/pptx"
 	"github.com/learn-demo/agent-go/internal/runtime/agent"
 	"github.com/learn-demo/agent-go/internal/runtime/memory"
 	"github.com/learn-demo/agent-go/internal/runtime/task"
+	"github.com/learn-demo/agent-go/internal/runtime/trace"
 )
 
 func NewRouter(logger *slog.Logger, chatAgent agent.Agent, tasks *task.Manager) http.Handler {
@@ -19,11 +21,21 @@ func NewRouter(logger *slog.Logger, chatAgent agent.Agent, tasks *task.Manager) 
 }
 
 func NewRouterWithAgents(logger *slog.Logger, agents map[string]agent.Agent, tasks *task.Manager, store memory.Store) http.Handler {
+	return NewRouterWithAgentsAndTrace(logger, agents, tasks, store, nil)
+}
+
+func NewRouterWithAgentsAndTrace(logger *slog.Logger, agents map[string]agent.Agent, tasks *task.Manager, store memory.Store, traces trace.Store) http.Handler {
+	return NewRouterWithAgentsTraceAndPPTX(logger, agents, tasks, store, traces, nil)
+}
+
+func NewRouterWithAgentsTraceAndPPTX(logger *slog.Logger, agents map[string]agent.Agent, tasks *task.Manager, store memory.Store, traces trace.Store, pptStore pptx.Store) http.Handler {
 	r := chi.NewRouter()
 	r.Use(corsMiddleware)
 
-	handler := NewAgentHandlerWithAgents(logger, agents, tasks)
+	handler := NewAgentHandlerWithAgentsAndTrace(logger, agents, tasks, traces)
 	sessionHandler := NewSessionHandler(logger, store)
+	traceHandler := NewTraceHandler(logger, traces)
+	pptxHandler := NewPPTXHandler(logger, pptStore)
 
 	r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -35,6 +47,7 @@ func NewRouterWithAgents(logger *slog.Logger, agents map[string]agent.Agent, tas
 		r.Get("/chat/stream", handler.ChatStream)
 		r.Get("/deep/stream", handler.DeepStream)
 		r.Get("/skills/stream", handler.SkillsStream)
+		r.Get("/pptx/stream", handler.PptxStream)
 		r.Get("/stop", handler.StopAgent)
 		r.Post("/stop", handler.StopAgent)
 	})
@@ -50,6 +63,20 @@ func NewRouterWithAgents(logger *slog.Logger, agents map[string]agent.Agent, tas
 		r.Put("/{sessionId}/rename", sessionHandler.RenameSession)
 		r.Patch("/{sessionId}/rename", sessionHandler.RenameSession)
 		r.Post("/{sessionId}/rename", sessionHandler.RenameSession)
+	})
+
+	r.Route("/pptx", func(r chi.Router) {
+		r.Get("/latest", pptxHandler.Latest)
+		r.Get("/{pptId}", pptxHandler.Detail)
+		r.Get("/{pptId}/preview", pptxHandler.Preview)
+		r.Get("/{pptId}/download", pptxHandler.Download)
+	})
+
+	r.Route("/trace", func(r chi.Router) {
+		r.Get("/detail", traceHandler.GetTrace)
+		r.Get("/replay/stream", traceHandler.ReplayStream)
+		r.Get("/{traceId}", traceHandler.GetTrace)
+		r.Get("/{traceId}/replay/stream", traceHandler.ReplayStream)
 	})
 
 	mountWebApp(r, logger, webDistDir())

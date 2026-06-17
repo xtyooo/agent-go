@@ -25,6 +25,10 @@ type Config struct {
 	Tools ToolsConfig `yaml:"tools"`
 	// Skills 保存本地技能目录配置，对应 Java dodo-agent 的 skills.directory。
 	Skills SkillsConfig `yaml:"skills"`
+	// MCP 保存外部 MCP Server 配置，对应 Java dodo-agent 的 McpSyncClient 初始化。
+	MCP MCPConfig `yaml:"mcp"`
+	// Observability 保存可观测性配置，例如 trace 记录和离线回放。
+	Observability ObservabilityConfig `yaml:"observability"`
 }
 
 // ServerConfig 是 HTTP Server 的启动参数。
@@ -96,6 +100,52 @@ type SkillsConfig struct {
 	AutoReload bool `yaml:"auto-reload"`
 }
 
+// MCPConfig 聚合所有可选 MCP Server。
+type MCPConfig struct {
+	// Servers 是 application.yaml 中声明的 MCP server 列表。
+	Servers []MCPServerConfig `yaml:"servers"`
+}
+
+// MCPServerConfig 描述一个 MCP server 的连接方式和注册策略。
+type MCPServerConfig struct {
+	// Name 是本地日志和工具名前缀使用的 server 名称。
+	Name string `yaml:"name"`
+	// Enabled 控制该 server 是否在启动时连接。
+	Enabled bool `yaml:"enabled"`
+	// Transport 支持 streamable-http、sse、command。
+	Transport string `yaml:"transport"`
+	// URL 是 streamable-http 或 sse transport 的 endpoint。
+	URL string `yaml:"url"`
+	// Command 是 command transport 的可执行文件。
+	Command string `yaml:"command"`
+	// Args 是 command transport 的命令参数。
+	Args []string `yaml:"args"`
+	// Headers 是 HTTP transport 的固定请求头，适合 Authorization 等鉴权信息。
+	Headers map[string]string `yaml:"headers"`
+	// ToolPrefix 为空时使用 name 作为前缀；设置为 "-" 可关闭前缀。
+	ToolPrefix string `yaml:"tool-prefix"`
+	// TimeoutSeconds 控制连接、列工具和调用工具的超时时间。
+	TimeoutSeconds int `yaml:"timeout-seconds"`
+	// DisableStandaloneSSE 只对 streamable-http 有效，禁用独立 SSE 长连接。
+	DisableStandaloneSSE bool `yaml:"disable-standalone-sse"`
+}
+
+// ObservabilityConfig 聚合 Agent Runtime 的可观测性配置。
+type ObservabilityConfig struct {
+	// Trace 控制每次 Agent Run 的事件记录和回放能力。
+	Trace TraceConfig `yaml:"trace"`
+}
+
+// TraceConfig 是本地 trace 文件记录配置。
+type TraceConfig struct {
+	// Enabled 控制是否保存 Agent Run trace。
+	Enabled bool `yaml:"enabled"`
+	// Directory 是 trace JSON 文件目录。
+	Directory string `yaml:"directory"`
+	// MaxEventContentChars 限制单个事件长文本字段的保存长度。
+	MaxEventContentChars int `yaml:"max-event-content-chars"`
+}
+
 // TavilyConfig 是 Tavily 搜索工具配置。
 type TavilyConfig struct {
 	// Endpoint 是 Tavily Search API 地址。
@@ -149,6 +199,12 @@ func Default() Config {
 		},
 		Skills: SkillsConfig{
 			AutoReload: true,
+		},
+		Observability: ObservabilityConfig{
+			Trace: TraceConfig{
+				Directory:            "traces",
+				MaxEventContentChars: 4000,
+			},
 		},
 	}
 }
@@ -248,6 +304,44 @@ func (c *Config) normalize() {
 		}
 	}
 	c.Skills.Directories = uniqueStrings(normalizedDirs)
+
+	for i := range c.MCP.Servers {
+		server := &c.MCP.Servers[i]
+		server.Name = strings.TrimSpace(server.Name)
+		server.Transport = strings.ToLower(strings.TrimSpace(server.Transport))
+		server.URL = strings.TrimSpace(server.URL)
+		server.Command = strings.TrimSpace(server.Command)
+		server.ToolPrefix = strings.TrimSpace(server.ToolPrefix)
+		if server.Transport == "" {
+			server.Transport = "streamable-http"
+		}
+		if server.TimeoutSeconds <= 0 {
+			server.TimeoutSeconds = 30
+		}
+		if server.Headers == nil {
+			server.Headers = map[string]string{}
+		}
+		for k, v := range server.Headers {
+			cleanKey := strings.TrimSpace(k)
+			cleanValue := strings.TrimSpace(v)
+			if cleanKey == "" || cleanValue == "" {
+				delete(server.Headers, k)
+				continue
+			}
+			if cleanKey != k {
+				delete(server.Headers, k)
+			}
+			server.Headers[cleanKey] = cleanValue
+		}
+	}
+
+	c.Observability.Trace.Directory = strings.TrimSpace(c.Observability.Trace.Directory)
+	if c.Observability.Trace.Directory == "" {
+		c.Observability.Trace.Directory = "traces"
+	}
+	if c.Observability.Trace.MaxEventContentChars <= 0 {
+		c.Observability.Trace.MaxEventContentChars = 4000
+	}
 }
 
 func uniqueStrings(values []string) []string {

@@ -19,9 +19,24 @@ type StreamSummary struct {
 	FirstEventMs int64
 }
 
+// StreamObserver 是 SSE 写出边界的观察者。
+// Trace Runtime 通过这个回调记录已经准备写给前端的事件，但不会影响事件本身的发送。
+type StreamObserver func(event.Event)
+
+// StreamOptions 保存 SSE 写出时的可选扩展能力。
+type StreamOptions struct {
+	// Observer 会在事件写入 ResponseWriter 前被调用。
+	Observer StreamObserver
+}
+
 // StreamEvents 把 Agent 事件 channel 写成浏览器可消费的 SSE。
 // 这里是 HTTP 层和 Agent 层的背压边界：客户端断开会通过 request context 反向取消 Agent。
 func StreamEvents(w http.ResponseWriter, r *http.Request, events <-chan event.Event, logger *slog.Logger, conversationID string, requestID string) StreamSummary {
+	return StreamEventsWithOptions(w, r, events, logger, conversationID, requestID, StreamOptions{})
+}
+
+// StreamEventsWithOptions 把 Agent 事件写成 SSE，并允许调用方观察已发送事件。
+func StreamEventsWithOptions(w http.ResponseWriter, r *http.Request, events <-chan event.Event, logger *slog.Logger, conversationID string, requestID string, options StreamOptions) StreamSummary {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -81,6 +96,9 @@ func StreamEvents(w http.ResponseWriter, r *http.Request, events <-chan event.Ev
 				return summary
 			}
 			recordEvent(&summary, evt, startedAt)
+			if options.Observer != nil {
+				options.Observer(evt)
+			}
 			writeSSE(w, evt)
 			flusher.Flush()
 		}

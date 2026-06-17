@@ -20,6 +20,12 @@ export const AGENT_OPTIONS = [
     label: "Skills",
     description: "适合调用本地技能目录里的能力",
     streamPath: "/agent/skills/stream"
+  },
+  {
+    value: "pptx",
+    label: "PPTBuilder",
+    description: "适合生成、继续或修改演示文稿",
+    streamPath: "/agent/pptx/stream"
   }
 ];
 
@@ -69,7 +75,36 @@ export async function stopAgent(conversationId) {
   });
 }
 
-export function buildStreamURL({ query, conversationId, agentType, temperature, maxTurns }) {
+export async function fetchTraceDetail(traceId) {
+  return requestJSON(`/trace/detail?traceId=${encodeURIComponent(traceId)}`);
+}
+
+export async function fetchPPTLatest(conversationId) {
+  return requestJSON(`/pptx/latest?conversationId=${encodeURIComponent(conversationId)}`, {
+    allowNotFound: true
+  });
+}
+
+export function buildPPTPreviewURL(pptId) {
+  return `/pptx/${encodeURIComponent(pptId)}/preview`;
+}
+
+export function buildPPTDownloadURL(pptId) {
+  return `/pptx/${encodeURIComponent(pptId)}/download`;
+}
+
+export function buildTraceReplayURL({ traceId, originalTiming = false, maxDelayMs = 500 }) {
+  const params = new URLSearchParams({
+    traceId
+  });
+  if (originalTiming) {
+    params.set("timing", "original");
+    params.set("maxDelayMs", String(maxDelayMs));
+  }
+  return `/trace/replay/stream?${params.toString()}`;
+}
+
+export function buildStreamURL({ query, conversationId, agentType, temperature, maxTurns, traceId }) {
   const agent = findAgent(agentType);
   const params = new URLSearchParams({
     query,
@@ -77,6 +112,7 @@ export function buildStreamURL({ query, conversationId, agentType, temperature, 
     temperature: String(temperature),
     maxTurns: String(maxTurns)
   });
+  if (traceId) params.set("traceId", traceId);
   return `${agent.streamPath}?${params.toString()}`;
 }
 

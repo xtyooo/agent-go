@@ -12,17 +12,20 @@ import (
 	"time"
 
 	"github.com/learn-demo/agent-go/internal/agents/planexecute"
+	"github.com/learn-demo/agent-go/internal/agents/pptx"
 	"github.com/learn-demo/agent-go/internal/agents/skills"
 	"github.com/learn-demo/agent-go/internal/agents/websearch"
 	httpapi "github.com/learn-demo/agent-go/internal/api/http"
 	"github.com/learn-demo/agent-go/internal/infra/config"
 	"github.com/learn-demo/agent-go/internal/runtime/agent"
 	"github.com/learn-demo/agent-go/internal/runtime/contextx"
+	mcpruntime "github.com/learn-demo/agent-go/internal/runtime/mcp"
 	"github.com/learn-demo/agent-go/internal/runtime/memory"
 	"github.com/learn-demo/agent-go/internal/runtime/model"
 	"github.com/learn-demo/agent-go/internal/runtime/skill"
 	"github.com/learn-demo/agent-go/internal/runtime/task"
 	"github.com/learn-demo/agent-go/internal/runtime/tool"
+	"github.com/learn-demo/agent-go/internal/runtime/trace"
 )
 
 func main() {
@@ -52,6 +55,9 @@ func main() {
 		"tavily_endpoint", cfg.Tools.Tavily.Endpoint,
 		"skills_enabled", len(cfg.Skills.Directories) > 0,
 		"skills_directories", strings.Join(cfg.Skills.Directories, ","),
+		"mcp_server_count", len(cfg.MCP.Servers),
+		"trace_enabled", cfg.Observability.Trace.Enabled,
+		"trace_directory", cfg.Observability.Trace.Directory,
 	)
 
 	chatModel, err := model.NewOpenAICompatible(model.OpenAIConfig{
@@ -90,6 +96,17 @@ func main() {
 	if skillManager.Enabled() {
 		readSkillTool = tool.NewReadSkillTool(skillManager, logger)
 	}
+	loadedMCP, err := mcpruntime.LoadTools(context.Background(), toMCPRuntimeConfig(cfg), logger)
+	if err != nil {
+		logger.Error("❌ MCP Runtime 初始化失败", "error", err)
+		os.Exit(1)
+	}
+	defer func() {
+		if err := loadedMCP.Close(); err != nil {
+			logger.Warn("⚠ MCP Runtime 关闭失败", "error", err)
+		}
+	}()
+
 	tools, err := tool.NewDefaultRegistry(tool.DefaultRegistryConfig{
 		WebSearch: tool.WebSearchConfig{
 			APIKey:      cfg.Tools.Tavily.APIKey,
@@ -99,7 +116,8 @@ func main() {
 			MaxResults:  cfg.Tools.Tavily.MaxResults,
 			Timeout:     time.Duration(cfg.Tools.Tavily.TimeoutSeconds) * time.Second,
 		},
-		ReadSkill: readSkillTool,
+		ReadSkill:  readSkillTool,
+		ExtraTools: loadedMCP.Tools,
 	})
 	if err != nil {
 		logger.Error("\U0000274C 工具运行时配置无效", "error", err)
@@ -110,6 +128,7 @@ func main() {
 		"tool_count", len(tools.Names()),
 		"tools", strings.Join(tools.Names(), ","),
 		"skill_count", skillCount,
+		"mcp_tool_count", len(loadedMCP.Tools),
 	)
 
 	memoryStore, err := newMemoryStore(cfg, logger)
@@ -153,20 +172,45 @@ func main() {
 			CharsPerToken:        cfg.Context.CharsPerToken,
 		}),
 	)
+	pptxStore := pptx.NewMemoryStore()
+	pptxAgent := pptx.New(chatModel, tools, logger,
+		pptx.WithStore(pptxStore),
+		pptx.WithMemory(memoryStore, cfg.Memory.MaxHistoryRecords),
+	)
 	agents := map[string]agent.Agent{
 		"websearch":    chatAgent,
 		"plan-execute": deepAgent,
 		"skills":       skillsAgent,
+		"pptx":         pptxAgent,
 	}
 	logger.Info("\U0001F916 Agent 注册完成",
 		"agent_count", len(agents),
-		"agents", "websearch,plan-execute,skills",
+		"agents", "websearch,plan-execute,skills,pptx",
 	)
 	taskManager := task.NewManager(logger)
+	traceStore, err := trace.NewFileStore(trace.Config{
+		Enabled:              cfg.Observability.Trace.Enabled,
+		Directory:            cfg.Observability.Trace.Directory,
+		MaxEventContentChars: cfg.Observability.Trace.MaxEventContentChars,
+	}, logger)
+	if err != nil {
+		logger.Error("❌ Trace Runtime 配置无效", "error", err)
+		os.Exit(1)
+	}
+	if traceStore.Enabled() {
+		logger.Info("🧭 Trace Runtime 已启用",
+			"directory", cfg.Observability.Trace.Directory,
+			"max_event_content_chars", cfg.Observability.Trace.MaxEventContentChars,
+			"detail_endpoint", "/trace/detail?traceId=...",
+			"replay_endpoint", "/trace/replay/stream?traceId=...",
+		)
+	} else {
+		logger.Info("🧭 Trace Runtime 未启用，跳过 Agent Run 记录")
+	}
 
 	server := &http.Server{
 		Addr:              ":" + cfg.Server.Port,
-		Handler:           httpapi.NewRouterWithAgents(logger, agents, taskManager, memoryStore),
+		Handler:           httpapi.NewRouterWithAgentsTraceAndPPTX(logger, agents, taskManager, memoryStore, traceStore, pptxStore),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
@@ -187,6 +231,25 @@ func main() {
 	}
 
 	logger.Info("\U00002705 服务已停止")
+}
+
+func toMCPRuntimeConfig(cfg config.Config) mcpruntime.Config {
+	servers := make([]mcpruntime.ServerConfig, 0, len(cfg.MCP.Servers))
+	for _, server := range cfg.MCP.Servers {
+		servers = append(servers, mcpruntime.ServerConfig{
+			Name:                 server.Name,
+			Enabled:              server.Enabled,
+			Transport:            server.Transport,
+			URL:                  server.URL,
+			Command:              server.Command,
+			Args:                 server.Args,
+			Headers:              server.Headers,
+			ToolPrefix:           server.ToolPrefix,
+			Timeout:              time.Duration(server.TimeoutSeconds) * time.Second,
+			DisableStandaloneSSE: server.DisableStandaloneSSE,
+		})
+	}
+	return mcpruntime.Config{Servers: servers}
 }
 
 func serveHTTP(server *http.Server, logger *slog.Logger) {

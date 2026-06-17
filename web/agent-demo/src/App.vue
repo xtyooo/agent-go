@@ -159,8 +159,56 @@
               </div>
             </div>
 
+            <div v-if="showRunProgress(message)" class="run-progress" role="status">
+              <div class="run-progress-orbit" aria-hidden="true">
+                <span></span>
+                <span></span>
+                <span></span>
+              </div>
+              <div class="run-progress-copy">
+                <strong>{{ runningPhase(message).title }}</strong>
+                <small>{{ runningPhase(message).detail }}</small>
+              </div>
+              <div class="run-progress-rail" aria-hidden="true">
+                <span :style="{ width: `${runningPhase(message).percent}%` }"></span>
+              </div>
+            </div>
+
             <div v-if="message.content" class="markdown-body" v-html="renderMarkdown(message.content)"></div>
-            <div v-else-if="message.role === 'assistant' && isRunning" class="typing">
+            <div v-if="message.role === 'assistant' && pptArtifact(message)" class="artifact-card">
+              <div class="artifact-icon">
+                <Presentation :size="18" />
+              </div>
+              <div class="artifact-copy">
+                <strong>{{ pptArtifact(message).title }}</strong>
+                <small>{{ pptArtifact(message).meta }}</small>
+              </div>
+              <div class="artifact-actions">
+                <button
+                  class="artifact-button"
+                  type="button"
+                  :disabled="pptArtifact(message).previewDisabled"
+                  title="在线预览"
+                  @click="openPPTPreview(pptArtifact(message))"
+                >
+                  <Eye :size="15" />
+                  <span>预览</span>
+                </button>
+                <a
+                  class="artifact-button primary"
+                  :class="{ disabled: pptArtifact(message).downloadDisabled }"
+                  :href="pptArtifact(message).downloadUrl || '#'"
+                  :aria-disabled="pptArtifact(message).downloadDisabled"
+                  :download="pptArtifact(message).downloadFilename"
+                  title="下载 PPTX"
+                  @click="handlePPTDownloadClick($event, pptArtifact(message))"
+                >
+                  <Download :size="15" />
+                  <span>下载</span>
+                </a>
+              </div>
+            </div>
+            <div v-else-if="message.role === 'assistant' && isRunning && !message.content" class="typing">
               <span></span>
               <span></span>
               <span></span>
@@ -314,6 +362,61 @@
             <span>首响</span>
             <strong>{{ firstResponseLabel }}</strong>
           </div>
+          <div>
+            <span>Trace ID</span>
+            <strong>{{ currentTraceId || "-" }}</strong>
+          </div>
+          <div>
+            <span>模式</span>
+            <strong>{{ runModeLabel }}</strong>
+          </div>
+        </div>
+      </section>
+
+      <section class="settings-section">
+        <div class="section-title">
+          <label>Trace 回放</label>
+          <button class="text-button" type="button" :disabled="!traceIdInput" @click="copyTraceId">复制 ID</button>
+        </div>
+        <div class="trace-card">
+          <label class="trace-field">
+            <span>Trace ID</span>
+            <input v-model.trim="traceIdInput" type="text" placeholder="粘贴 traceId 或运行后自动填入" />
+          </label>
+          <div class="trace-actions">
+            <button class="tool-button" type="button" :disabled="traceLoading || !traceIdInput" @click="loadTraceDetail">
+              <SearchCheck :size="15" />
+              查询
+            </button>
+            <button class="tool-button" type="button" :disabled="isRunning || !traceIdInput" @click="replayTrace(false)">
+              <Play :size="15" />
+              快速回放
+            </button>
+            <button class="tool-button" type="button" :disabled="isRunning || !traceIdInput" @click="replayTrace(true)">
+              <Clock :size="15" />
+              原速
+            </button>
+          </div>
+          <p v-if="traceError" class="trace-error">{{ traceError }}</p>
+          <div v-if="traceDetail" class="trace-summary">
+            <div>
+              <span>Agent</span>
+              <strong>{{ traceDetail.agentType || "-" }}</strong>
+            </div>
+            <div>
+              <span>状态</span>
+              <strong>{{ traceDetail.status || "-" }}</strong>
+            </div>
+            <div>
+              <span>事件</span>
+              <strong>{{ traceDetail.eventCount || 0 }}</strong>
+            </div>
+            <div>
+              <span>耗时</span>
+              <strong>{{ formatDuration(traceDetail.elapsedMs) }}</strong>
+            </div>
+          </div>
+          <div v-if="traceDetail" class="trace-query">{{ traceDetail.query || "无查询文本" }}</div>
         </div>
       </section>
 
@@ -331,6 +434,34 @@
         </div>
       </section>
     </aside>
+
+    <div v-if="pptPreview.open" class="modal-layer" role="dialog" aria-modal="true" aria-label="PPT 在线预览">
+      <button class="modal-backdrop" type="button" aria-label="关闭 PPT 预览" @click="closePPTPreview"></button>
+      <section class="ppt-preview-modal">
+        <header class="ppt-preview-header">
+          <div>
+            <strong>{{ pptPreview.title }}</strong>
+            <small>{{ pptPreview.subtitle }}</small>
+          </div>
+          <div class="ppt-preview-actions">
+            <a
+              v-if="pptPreview.downloadUrl"
+              class="tool-button"
+              :href="pptPreview.downloadUrl"
+              :download="pptPreview.downloadFilename"
+            >
+              <Download :size="15" />
+              下载 PPTX
+            </a>
+            <button class="icon-button" type="button" title="关闭预览" @click="closePPTPreview">
+              <X :size="18" />
+            </button>
+          </div>
+        </header>
+        <iframe v-if="pptPreview.url" class="ppt-preview-frame" :src="pptPreview.url" title="PPT 在线预览"></iframe>
+        <div v-else class="ppt-preview-empty">当前 PPT 还没有可预览内容</div>
+      </section>
+    </div>
   </div>
 </template>
 
@@ -342,7 +473,10 @@ import {
   Check,
   ChevronDown,
   CircleAlert,
+  Clock,
   Copy,
+  Download,
+  Eye,
   ExternalLink,
   Folder,
   Library,
@@ -354,19 +488,28 @@ import {
   PanelRight,
   PanelRightClose,
   Pencil,
+  Play,
   Plus,
+  Presentation,
   Search,
+  SearchCheck,
   SendHorizontal,
   Share2,
   Sparkles,
   Square,
   Trash2,
-  UserRound
+  UserRound,
+  X
 } from "@lucide/vue";
 import {
   AGENT_OPTIONS,
+  buildPPTDownloadURL,
+  buildPPTPreviewURL,
+  buildTraceReplayURL,
   buildStreamURL,
   deleteSession,
+  fetchPPTLatest,
+  fetchTraceDetail,
   fetchSessionDetail,
   fetchSessions,
   findAgent,
@@ -379,9 +522,11 @@ import { renderMarkdown } from "./markdown";
 const starterPrompts = [
   "帮我总结一下这个 Agent 项目的架构",
   "用 Deep Agent 制定一个重构计划",
-  "搜索最近的 Go SSE 最佳实践",
-  "分析当前技能系统还能怎么扩展"
+  "生成一份 AI Agent 技术分享 PPT，6 页，科技风",
+  "回放上一次失败的 Agent trace"
 ];
+
+const TRACE_ID_PREFIX = "web";
 
 const sidebarOpen = ref(false);
 const detailsOpen = ref(false);
@@ -405,6 +550,20 @@ const eventSource = ref(null);
 const currentAssistantId = ref("");
 const runStartedAt = ref(0);
 const firstResponseMs = ref(0);
+const currentTraceId = ref("");
+const traceIdInput = ref("");
+const traceDetail = ref(null);
+const traceLoading = ref(false);
+const traceError = ref("");
+const replayingTrace = ref(false);
+const pptPreview = ref({
+  open: false,
+  url: "",
+  title: "",
+  subtitle: "",
+  downloadUrl: "",
+  downloadFilename: ""
+});
 const scrollPanel = ref(null);
 const composerInput = ref(null);
 const pendingToolCallIds = new Map();
@@ -418,6 +577,7 @@ const headerSubtitle = computed(() => {
   return "选择历史会话，或开启一个新问题";
 });
 const statusLabel = computed(() => (isRunning.value ? "运行中" : "空闲"));
+const runModeLabel = computed(() => (replayingTrace.value ? "Trace 回放" : "实时运行"));
 const canSend = computed(() => draft.value.trim().length > 0 && !isRunning.value);
 const canManageSession = computed(() => Boolean(activeConversationId.value) && messages.value.length > 0 && !isRunning.value);
 const lastAssistantText = computed(() => {
@@ -478,7 +638,11 @@ async function openSession(sessionId) {
     messages.value = records.flatMap(recordToMessages);
     streamEvents.value = [];
     firstResponseMs.value = records.at(-1)?.firstResponseTime || 0;
+    currentTraceId.value = "";
+    traceDetail.value = null;
+    traceError.value = "";
     sidebarOpen.value = false;
+    hydratePPTArtifactForCurrentSession();
   } catch (error) {
     errorText.value = error.message || "读取会话详情失败";
   }
@@ -552,12 +716,16 @@ function parseReferences(value) {
 function startNewConversation() {
   if (isRunning.value) return;
   closeStream();
+  closePPTPreview();
   activeConversationId.value = "";
   activeSessionTitle.value = "";
   messages.value = [];
   streamEvents.value = [];
   errorText.value = "";
   firstResponseMs.value = 0;
+  currentTraceId.value = "";
+  traceDetail.value = null;
+  traceError.value = "";
   pendingToolCallIds.clear();
   sidebarOpen.value = false;
   focusComposer();
@@ -614,7 +782,12 @@ async function sendMessage() {
   closeStream();
   errorText.value = "";
   const conversationId = activeConversationId.value || createConversationId();
+  const traceId = createTraceId();
   activeConversationId.value = conversationId;
+  currentTraceId.value = traceId;
+  traceIdInput.value = traceId;
+  traceDetail.value = null;
+  traceError.value = "";
   if (!activeSessionTitle.value) activeSessionTitle.value = compactText(query);
 
   const userMessage = {
@@ -637,6 +810,7 @@ async function sendMessage() {
   resizeComposer();
 
   isRunning.value = true;
+  replayingTrace.value = false;
   runStartedAt.value = performance.now();
   firstResponseMs.value = 0;
   streamEvents.value = [];
@@ -647,23 +821,11 @@ async function sendMessage() {
     conversationId,
     agentType: agentType.value,
     temperature: temperature.value,
-    maxTurns: maxTurns.value
+    maxTurns: maxTurns.value,
+    traceId
   });
 
-  const source = new EventSource(url);
-  eventSource.value = source;
-  source.onmessage = (message) => {
-    try {
-      handleStreamEvent(JSON.parse(message.data));
-    } catch (error) {
-      failRun(`事件解析失败：${error.message}`);
-    }
-  };
-  source.onerror = () => {
-    if (eventSource.value) {
-      failRun("SSE 连接异常，请确认 Go 服务和模型配置可用");
-    }
-  };
+  openEventStream(url, "SSE 连接异常，请确认 Go 服务和模型配置可用");
 }
 
 function handleStreamEvent(event) {
@@ -760,7 +922,7 @@ function handleStreamEvent(event) {
   }
 
   if (event.type === "complete") {
-      finishRun();
+    finishRun();
   }
 }
 
@@ -784,6 +946,7 @@ function appendThinkingProcess(assistant, event) {
   item.status = "running";
   item.meta = "正在运行";
   item.detail = appendProcessDetail(item.detail, content);
+  assistant.runningPhase = inferRunningPhase(assistant);
 }
 
 function appendProcessDetail(current, next) {
@@ -791,8 +954,98 @@ function appendProcessDetail(current, next) {
   return current + next;
 }
 
+function openEventStream(url, errorMessage) {
+  const source = new EventSource(url);
+  eventSource.value = source;
+  source.onmessage = (message) => {
+    try {
+      handleStreamEvent(JSON.parse(message.data));
+    } catch (error) {
+      failRun(`事件解析失败：${error.message}`);
+    }
+  };
+  source.onerror = () => {
+    if (eventSource.value) {
+      failRun(errorMessage);
+    }
+  };
+}
+
+async function loadTraceDetail() {
+  const traceId = traceIdInput.value.trim();
+  if (!traceId) return;
+  traceLoading.value = true;
+  traceError.value = "";
+  try {
+    traceDetail.value = await fetchTraceDetail(traceId);
+    currentTraceId.value = traceDetail.value.traceId || traceId;
+  } catch (error) {
+    traceDetail.value = null;
+    traceError.value = error.message || "Trace 查询失败";
+  } finally {
+    traceLoading.value = false;
+  }
+}
+
+async function replayTrace(originalTiming = false) {
+  const traceId = traceIdInput.value.trim();
+  if (!traceId || isRunning.value) return;
+
+  closeStream();
+  errorText.value = "";
+  traceError.value = "";
+  currentTraceId.value = traceId;
+  if (!traceDetail.value || traceDetail.value.traceId !== traceId) {
+    try {
+      traceDetail.value = await fetchTraceDetail(traceId);
+    } catch (error) {
+      traceDetail.value = null;
+      traceError.value = error.message || "Trace 查询失败";
+      return;
+    }
+  }
+
+  const run = traceDetail.value || {};
+  activeConversationId.value = run.conversationId || `trace_${traceId}`;
+  activeSessionTitle.value = compactText(run.query, `Trace ${traceId}`);
+  agentType.value = run.agentType || agentType.value;
+  messages.value = [
+    {
+      id: `trace-user-${traceId}`,
+      role: "user",
+      content: run.query || `Replay trace ${traceId}`,
+      createdAt: run.startedAt || new Date().toISOString()
+    },
+    {
+      id: `trace-assistant-${traceId}`,
+      role: "assistant",
+      content: "",
+      createdAt: run.startedAt || new Date().toISOString(),
+      process: [],
+      references: []
+    }
+  ];
+  currentAssistantId.value = `trace-assistant-${traceId}`;
+  streamEvents.value = [];
+  pendingToolCallIds.clear();
+  firstResponseMs.value = 0;
+  runStartedAt.value = performance.now();
+  isRunning.value = true;
+  replayingTrace.value = true;
+  detailsOpen.value = false;
+
+  openEventStream(
+    buildTraceReplayURL({ traceId, originalTiming }),
+    "Trace 回放连接异常，请确认 trace 文件仍然存在"
+  );
+}
+
 async function stopRun() {
   if (!isRunning.value || !activeConversationId.value) return;
+  if (replayingTrace.value) {
+    finishRun();
+    return;
+  }
   try {
     await stopAgent(activeConversationId.value);
   } catch (error) {
@@ -803,12 +1056,17 @@ async function stopRun() {
 }
 
 function finishRun(processStatus = "success") {
+  const shouldHydratePPT = processStatus === "success" && !replayingTrace.value && agentType.value === "pptx";
   settleRunningProcesses(processStatus);
   closeStream();
   isRunning.value = false;
+  replayingTrace.value = false;
   currentAssistantId.value = "";
   pendingToolCallIds.clear();
   loadSessions({ silent: true });
+  if (shouldHydratePPT) {
+    hydratePPTArtifactForCurrentSession();
+  }
 }
 
 function failRun(message) {
@@ -848,6 +1106,142 @@ function currentAssistant() {
   return messages.value.find((item) => item.id === currentAssistantId.value);
 }
 
+function createTraceId() {
+  const stamp = Date.now().toString(36);
+  const random = Math.random().toString(36).slice(2, 10);
+  return `${TRACE_ID_PREFIX}_${stamp}_${random}`;
+}
+
+function showRunProgress(message) {
+  return message.role === "assistant" && isRunning.value && message.id === currentAssistantId.value;
+}
+
+function runningPhase(message) {
+  return message.runningPhase || inferRunningPhase(message);
+}
+
+function inferRunningPhase(message) {
+  const detail = message?.process?.find((item) => item.kind === "thinking")?.detail || "";
+  const isPPT = agentType.value === "pptx";
+  if (isPPT) {
+    const stages = [
+      { match: ["分析", "需求"], title: "正在分析 PPT 需求", detail: "整理主题、页数、受众与风格", percent: 16 },
+      { match: ["收集", "搜索", "资料"], title: "正在收集资料", detail: "为页面内容补充上下文", percent: 32 },
+      { match: ["模板"], title: "正在选择模板", detail: "匹配演示文稿的视觉结构", percent: 48 },
+      { match: ["大纲"], title: "正在生成大纲", detail: "拆分页面顺序与叙事节奏", percent: 64 },
+      { match: ["Schema", "内容设计", "设计"], title: "正在设计页面内容", detail: "把大纲转成可预览的幻灯片结构", percent: 78 },
+      { match: ["渲染"], title: "正在渲染 PPT", detail: "生成预览与下载产物", percent: 90 },
+      { match: ["总结"], title: "正在整理结果", detail: "准备最后的说明和产物入口", percent: 96 }
+    ];
+    const matched = stages.find((stage) => stage.match.some((word) => detail.includes(word)));
+    if (matched) return matched;
+    return { title: "正在生成 PPT", detail: "PPTBuilder 正在推进生成流程", percent: 12 };
+  }
+  if (message?.process?.some((item) => item.kind === "tool" && item.status === "running")) {
+    return { title: "正在使用工具", detail: "工具返回后会继续整理回答", percent: 58 };
+  }
+  if (detail) {
+    return { title: "正在思考", detail: compactText(detail.split("\n").filter(Boolean).at(-1), "正在整理上下文"), percent: 38 };
+  }
+  if (message?.content) {
+    return { title: "正在生成回答", detail: "内容会持续写入当前消息", percent: 74 };
+  }
+  return { title: "正在连接 Agent", detail: "已发送请求，等待首个事件", percent: 18 };
+}
+
+function pptArtifact(message) {
+  if (message?.pptArtifact) return normalizePPTArtifact(message.pptArtifact);
+  const match = String(message?.content || "").match(/(?:mock|https?|file):\/\/[^\s)）\]]+\.pptx|mock:\/\/ppt\/[^\s)）\]]+/i);
+  if (!match && agentType.value !== "pptx") return null;
+  const url = match?.[0]?.replace(/[。,.，]+$/, "") || "";
+  if (!url && !message?.pptArtifact) return null;
+  return {
+    id: "",
+    title: "PPT 产物",
+    url,
+    meta: url ? (url.startsWith("mock://") ? "后端已生成基础 PPTX 下载入口" : url) : "正在准备产物入口",
+    previewUrl: "",
+    downloadUrl: /^https?:\/\//i.test(url) || /^file:\/\//i.test(url) ? url : "",
+    downloadFilename: "kimo-agent.pptx",
+    previewDisabled: true,
+    downloadDisabled: !(/^https?:\/\//i.test(url) || /^file:\/\//i.test(url))
+  };
+}
+
+function normalizePPTArtifact(artifact) {
+  const id = artifact.id || "";
+  const pageCount = Number(artifact.pageCount || artifact.slides?.length || 0);
+  const title = artifact.title || "PPT 产物";
+  const downloadUrl = artifact.downloadUrl || (id ? buildPPTDownloadURL(id) : "");
+  const previewUrl = artifact.previewUrl || (id ? buildPPTPreviewURL(id) : "");
+  const rendererLabel = artifact.rendererStatus === "basic-pptx" ? "基础 PPTX" : "PPTX";
+  return {
+    id,
+    title,
+    url: artifact.fileUrl || artifact.url || "",
+    meta: artifact.meta || `${pageCount || "-"} 页 · ${rendererLabel} 可下载 · 支持在线预览`,
+    pageCount,
+    previewUrl,
+    downloadUrl,
+    downloadFilename: `kimo-agent-ppt-${id || Date.now()}.pptx`,
+    previewDisabled: !previewUrl,
+    downloadDisabled: !downloadUrl
+  };
+}
+
+async function hydratePPTArtifactForCurrentSession() {
+  const conversationId = activeConversationId.value;
+  if (!conversationId) return;
+  try {
+    const payload = await fetchPPTLatest(conversationId);
+    if (!payload?.success || !payload.id) return;
+    const target = [...messages.value].reverse().find((item) => item.role === "assistant");
+    if (!target) return;
+    target.pptArtifact = {
+      id: payload.id,
+      title: "PPT 产物",
+      pageCount: payload.pageCount,
+      previewUrl: payload.previewUrl,
+      downloadUrl: payload.downloadUrl,
+      rendererStatus: payload.rendererStatus,
+      fileUrl: payload.fileUrl,
+      slides: payload.slides
+    };
+  } catch {
+    // 历史会话里没有 PPT 实例时不打扰主聊天流程。
+  }
+}
+
+function openPPTPreview(artifact) {
+  if (!artifact || artifact.previewDisabled) return;
+  pptPreview.value = {
+    open: true,
+    url: artifact.previewUrl,
+    title: artifact.title || "PPT 在线预览",
+    subtitle: artifact.meta || "",
+    downloadUrl: artifact.downloadUrl || "",
+    downloadFilename: artifact.downloadFilename || "kimo-agent.pptx"
+  };
+}
+
+function closePPTPreview() {
+  pptPreview.value = {
+    open: false,
+    url: "",
+    title: "",
+    subtitle: "",
+    downloadUrl: "",
+    downloadFilename: ""
+  };
+}
+
+function handlePPTDownloadClick(event, artifact) {
+  if (!artifact || artifact.downloadDisabled) {
+    event.preventDefault();
+    errorText.value = "PPT 下载入口暂不可用，请等生成完成后再试";
+  }
+}
+
 async function promptRename() {
   const nextName = window.prompt("会话名称", activeTitle.value);
   if (nextName === null) return;
@@ -879,6 +1273,15 @@ async function copyLastAnswer() {
     await navigator.clipboard.writeText(lastAssistantText.value);
   } catch (error) {
     errorText.value = "复制失败，请手动选择文本复制";
+  }
+}
+
+async function copyTraceId() {
+  if (!traceIdInput.value) return;
+  try {
+    await navigator.clipboard.writeText(traceIdInput.value);
+  } catch (error) {
+    traceError.value = "复制失败，请手动选择 Trace ID";
   }
 }
 
@@ -921,6 +1324,7 @@ function eventSummary(event) {
   if (event.type === "tool_start") return `${event.toolName || "tool"} ${event.arguments || ""}`.trim();
   if (event.type === "tool_end") return `${event.toolName || "tool"} 完成`;
   if (event.type === "error") return event.message || event.content || event.code || "error";
+  if (event.type === "complete") return "完成";
   return compactText(event.content || event.message || event.code || JSON.stringify(event.data || {}), "");
 }
 </script>

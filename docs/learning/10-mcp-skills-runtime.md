@@ -1,29 +1,54 @@
 # Milestone 10 MCP + Skills Runtime
 
-本阶段先落地本地 Skills Runtime 小闭环，严格参考 Java dodo-agent 的手动 Skills 实现：
+本阶段目标是把工具生态做成可插拔运行时，同时保留 Java dodo-agent 的 Skills 能力。
+
+Java dodo-agent 的关键链路：
 
 ```text
+HttpClientStreamableHttpTransport
+-> McpClient.sync(...).initialize()
+-> SyncMcpToolCallbackProvider.getToolCallbacks()
+-> Agent defaultToolCallbacks(...)
+
 SkillManager
-FileSystemSkillRegistry
-SkillPromptFormatter
-ReadSkillTool
-SkillsReactAgent
+-> FileSystemSkillRegistry
+-> SkillPromptFormatter
+-> ReadSkillTool
+-> SkillsReactAgent
 ```
 
-Go 版当前链路：
+Go 版对应链路：
 
 ```text
+application.yaml mcp.servers
+-> internal/runtime/mcp.LoadTools
+-> 官方 github.com/modelcontextprotocol/go-sdk/mcp ClientSession
+-> MCP tools/list
+-> ToolAdapter 转成本项目 tool.Tool
+-> tool.Registry 统一注册
+-> ReAct Agent 原有 tool_calls 主循环调用
+
 application.yaml skills.directory
 -> 扫描 skills/*/SKILL.md
 -> 解析 description / allowedTools
 -> Skills prompt 注入系统提示词
 -> 模型按需调用 read_skill
 -> read_skill 返回完整技能正文
--> ReAct 下一轮基于技能指令回答
 ```
 
 ## 已实现范围
 
+- 新增 `internal/runtime/mcp`：
+  - 支持官方 MCP Go SDK：`github.com/modelcontextprotocol/go-sdk/mcp`。
+  - 支持 `streamable-http`、`sse`、`command` 三类 transport。
+  - 支持 HTTP headers、超时、禁用 streamable HTTP 独立 SSE 连接。
+  - 通过 `tools/list` 拉取远端工具清单。
+  - 通过 `ToolAdapter` 把远端 MCP tool 转成本地 `tool.Tool`。
+  - 通过 `CallTool` 把本地工具调用转发给远端 MCP server。
+- 扩展 `tool.DefaultRegistryConfig`：
+  - 新增 `ExtraTools []Tool`，用于接收 MCP 动态工具。
+- 扩展 `application.yaml`：
+  - 新增 `mcp.servers` 配置段，默认示例 server 为 disabled，不影响本地启动。
 - 新增 `internal/runtime/skill`：
   - `Manager`：扫描技能目录、缓存元数据、读取技能内容。
   - `Metadata`：保存 name、description、skillFile、allowedTools。
@@ -39,75 +64,94 @@ application.yaml skills.directory
 - 新增 HTTP 入口：
   - `GET /agent/skills/stream`
   - 仍复用 `/agent/stop?conversationId=...`。
-- 新增示例技能：
-  - `skills/code-review/SKILL.md`
-- 新增单元测试：
-  - 技能目录扫描
-  - front matter 解析
-  - prompt 格式
-  - `read_skill` 工具返回
 
-## 和 Java 的映射
+## MCP 工具命名
 
-Java：
+默认情况下，远端 MCP tool 会被注册成本地名字：
 
 ```text
-SkillManager
-SkillRegistry
-FileSystemSkillRegistry
-ReadSkillTool
-SkillsReactAgent
+mcp_<server>_<remote_tool>
 ```
 
-Go：
+例如 Tavily server 返回 `search`，本地工具名会是：
 
 ```text
-internal/runtime/skill.Manager
-internal/runtime/skill.Metadata
-internal/runtime/tool.ReadSkillTool
-internal/agents/skills.Agent
+mcp_tavily_search
 ```
 
-## 配置
+这样可以避免和本地 `web_search`、`current_time`、`read_skill` 重名。
+
+如果你确认不会重名，可以在配置里写：
 
 ```yaml
-skills:
-  directory: "skills"
-  auto-reload: true
+tool-prefix: "-"
 ```
 
-`directory` 下面每个子目录都是一个技能目录，目录内必须有 `SKILL.md`：
+这会直接使用远端工具名。
 
-```text
-skills/
-  code-review/
-    SKILL.md
+## 配置示例
+
+```yaml
+mcp:
+  servers:
+    - name: "tavily"
+      enabled: false
+      transport: "streamable-http"
+      url: "https://mcp.tavily.com/mcp/"
+      timeout-seconds: 30
+      disable-standalone-sse: true
+      tool-prefix: "mcp_tavily"
+      headers:
+        Authorization: "Bearer <your-mcp-token>"
 ```
+
+本项目不会在工具层读取环境变量。鉴权信息需要显式写入 `application.yaml`，或由你自己的配置渲染流程在启动前生成该文件。
+
+## 边界设计
+
+Agent 层仍然只依赖：
+
+```go
+type Tool interface {
+    Definition() Definition
+    Execute(ctx context.Context, input Input) (Result, error)
+}
+```
+
+MCP SDK 只出现在 `internal/runtime/mcp`。这样后续替换 SDK、增加鉴权、增加资源/Prompt 能力，都不会影响 ReAct、Plan-Execute、Skills Agent 主流程。
 
 ## 测试方式
 
-启动服务后：
+基础回归：
+
+```powershell
+& 'C:\Program Files\Go\bin\go.exe' test ./...
+```
+
+启动后测试 Skills：
 
 ```powershell
 curl.exe -N "http://127.0.0.1:8888/agent/skills/stream?conversationId=skills-1&query=请使用code-review技能说明如何审查这段代码"
 ```
 
-正常情况下，日志中应看到：
+启用 MCP 后，启动日志中应看到：
 
 ```text
-🧩 Skills Runtime 扫描完成
-🧩 技能已加载 skill=code-review
+🧩 MCP Server 开始连接
+✅ MCP Server 工具已加载
+🧩 MCP Runtime 加载完成
 ```
 
-前端/SSE 会看到 `tool_start/read_skill`、`tool_end/read_skill`，随后模型基于技能内容继续回答。
+当模型调用 MCP 工具时，应看到：
+
+```text
+🔌 MCP 工具调用开始
+✅ MCP 工具调用完成
+```
 
 ## 当前边界
 
-本次只实现本地 Skills Runtime，没有接入官方 MCP Go SDK。
-
-下一步 MCP 接入建议：
-
-- 定义 `internal/runtime/mcp` 包。
-- 通过配置加载 MCP server。
-- 把 MCP tools 转换为现有 `tool.Tool` 接口。
-- 保持 Agent 只依赖 `tool.Registry`，不要让 Agent 直接依赖 MCP SDK。
+- 已完成 MCP tools/list 和 tools/call 的基础闭环。
+- 暂未实现 MCP resources/prompts/list 的 Agent 暴露。
+- 暂未实现 MCP tool list changed 的热更新。
+- 配置中的 `${...}` 不会被自动展开；如果需要环境变量渲染，建议后续在 Config Runtime 统一实现。

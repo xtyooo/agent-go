@@ -36,3 +36,21 @@ tools:
 skills:
   directory: "skills"
   auto-reload: true
+
+mcp:
+  servers:
+    - name: "tavily"
+      enabled: true
+      transport: "streamable-http"
+      url: "https://tavily.ivanli.cc/mcp"
+      timeout-seconds: 30
+      disable-standalone-sse: true
+      tool-prefix: "mcp_tavily"
+      headers:
+        Authorization: "Bearer th-bwGh-pXEDzGeoWN8KnjD6OdsUbva9"
+
+observability:
+  trace:
+    enabled: true
+    directory: "traces"
+    max-event-content-chars: 4000

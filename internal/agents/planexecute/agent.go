@@ -56,7 +56,7 @@ func New(model model.Model, tools *tool.Registry, logger *slog.Logger, opts ...O
 		contextPolicy:     contextx.DefaultPolicy(),
 		memory:            memory.NoopStore{},
 		maxHistoryRecords: 30,
-		maxTasksPerRound:  4,
+		maxTasksPerRound:  10,
 		executionToolName: "web_search",
 	}
 	for _, opt := range opts {
