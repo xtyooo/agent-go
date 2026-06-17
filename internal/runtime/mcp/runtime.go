@@ -13,7 +13,7 @@ import (
 
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
-	"github.com/learn-demo/agent-go/internal/runtime/tool"
+	"agentG/internal/runtime/tool"
 )
 
 const (

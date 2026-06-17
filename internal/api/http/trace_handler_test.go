@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/learn-demo/agent-go/internal/runtime/event"
-	"github.com/learn-demo/agent-go/internal/runtime/trace"
+	"agentG/internal/runtime/event"
+	"agentG/internal/runtime/trace"
 )
 
 func TestTraceReplayStreamEmitsSavedEvents(t *testing.T) {

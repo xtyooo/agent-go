@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/learn-demo/agent-go/internal/runtime/skill"
+	"agentG/internal/runtime/skill"
 )
 
 func TestReadSkillToolExecute(t *testing.T) {

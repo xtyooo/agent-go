@@ -15,7 +15,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/learn-demo/agent-go/internal/runtime/event"
+	"agentG/internal/runtime/event"
 )
 
 const defaultMaxEventContentChars = 4000

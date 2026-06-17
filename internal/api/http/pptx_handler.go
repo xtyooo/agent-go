@@ -14,8 +14,8 @@ import (
 	"strings"
 	"time"
 
+	"agentG/internal/agents/pptx"
 	"github.com/go-chi/chi/v5"
-	"github.com/learn-demo/agent-go/internal/agents/pptx"
 )
 
 type PPTXHandler struct {

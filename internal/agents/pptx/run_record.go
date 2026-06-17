@@ -7,9 +7,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/learn-demo/agent-go/internal/runtime/agent"
-	"github.com/learn-demo/agent-go/internal/runtime/event"
-	"github.com/learn-demo/agent-go/internal/runtime/memory"
+	"agentG/internal/runtime/agent"
+	"agentG/internal/runtime/event"
+	"agentG/internal/runtime/memory"
 )
 
 type runRecord struct {

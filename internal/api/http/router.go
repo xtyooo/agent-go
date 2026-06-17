@@ -8,12 +8,12 @@ import (
 	"path/filepath"
 	"strings"
 
+	"agentG/internal/agents/pptx"
+	"agentG/internal/runtime/agent"
+	"agentG/internal/runtime/memory"
+	"agentG/internal/runtime/task"
+	"agentG/internal/runtime/trace"
 	"github.com/go-chi/chi/v5"
-	"github.com/learn-demo/agent-go/internal/agents/pptx"
-	"github.com/learn-demo/agent-go/internal/runtime/agent"
-	"github.com/learn-demo/agent-go/internal/runtime/memory"
-	"github.com/learn-demo/agent-go/internal/runtime/task"
-	"github.com/learn-demo/agent-go/internal/runtime/trace"
 )
 
 func NewRouter(logger *slog.Logger, chatAgent agent.Agent, tasks *task.Manager) http.Handler {

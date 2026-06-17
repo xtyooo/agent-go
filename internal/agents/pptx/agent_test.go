@@ -5,9 +5,9 @@ import (
 	"strings"
 	"testing"
 
-	runtimeagent "github.com/learn-demo/agent-go/internal/runtime/agent"
-	"github.com/learn-demo/agent-go/internal/runtime/event"
-	"github.com/learn-demo/agent-go/internal/runtime/model"
+	runtimeagent "agentG/internal/runtime/agent"
+	"agentG/internal/runtime/event"
+	"agentG/internal/runtime/model"
 )
 
 type fakeModel struct {

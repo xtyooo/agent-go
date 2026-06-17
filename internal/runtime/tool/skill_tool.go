@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 
-	"github.com/learn-demo/agent-go/internal/runtime/skill"
+	"agentG/internal/runtime/skill"
 )
 
 // ReadSkillTool 按名称加载本地 SKILL.md 内容。

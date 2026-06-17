@@ -2,19 +2,19 @@ package websearch
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"sort"
 	"strings"
 	"time"
 
-	"github.com/learn-demo/agent-go/internal/runtime/agent"
-	"github.com/learn-demo/agent-go/internal/runtime/contextx"
-	"github.com/learn-demo/agent-go/internal/runtime/event"
-	"github.com/learn-demo/agent-go/internal/runtime/memory"
-	"github.com/learn-demo/agent-go/internal/runtime/model"
-	"github.com/learn-demo/agent-go/internal/runtime/tool"
+	"agentG/internal/runtime/agent"
+	"agentG/internal/runtime/contextx"
+	"agentG/internal/runtime/event"
+	"agentG/internal/runtime/memory"
+	"agentG/internal/runtime/model"
+	reactruntime "agentG/internal/runtime/react"
+	"agentG/internal/runtime/tool"
 )
 
 const defaultMaxRounds = 5
@@ -191,7 +191,7 @@ func (a *ReactAgent) runAsync(ctx context.Context, input agent.Input, events cha
 		Ctx: ctx,
 		Out: events,
 		OnCancel: func(evt event.Event, err error) {
-			logger.Warn("🛑 Agent 事件发送被取消",
+			logger.Warn("🚫 Agent 事件发送被取消",
 				"conversation_id", input.ConversationID,
 				"event_type", evt.Type,
 				"elapsed_ms", elapsedMillis(startedAt),
@@ -203,7 +203,6 @@ func (a *ReactAgent) runAsync(ctx context.Context, input agent.Input, events cha
 		},
 	})
 
-	// 初始消息严格对应 Java WebSearchReactAgent：系统提示词 + 包裹在 <question> 中的用户问题。
 	systemMessages := []model.Message{
 		{Role: model.RoleSystem, Content: a.systemPromptBuilder(time.Now())},
 	}
@@ -213,10 +212,41 @@ func (a *ReactAgent) runAsync(ctx context.Context, input agent.Input, events cha
 	messages := contextResult.Messages
 	a.saveRunQuestion(ctx, logger, input, runRecord)
 
-	// agentState 是跨轮次状态，目前主要保存搜索结果。
-	// roundState 只存在于单个轮次内；agentState 会一直传到最终输出 reference。
 	state := agentState{searchResults: make([]tool.SearchResult, 0)}
-	if !a.scheduleRounds(ctx, sender.Send, input.ConversationID, input.RequestID, runCfg, messages, &state) {
+	loop := reactruntime.New(a.model, a.tools, logger,
+		reactruntime.WithMaxRounds(runCfg.maxRounds),
+		reactruntime.WithHooks(reactruntime.Hooks{
+			BeforeTool: func(ctx context.Context, call model.ToolCall, emit func(event.Event) bool) bool {
+				if !strings.Contains(call.Name, "search") {
+					return true
+				}
+				query := reactruntime.ExtractQuery(call.Arguments)
+				if query != "" {
+					return emit(event.Thinking("Searching information: " + query + "\n"))
+				}
+				return emit(event.Thinking("Searching related information\n"))
+			},
+			AfterTool: func(ctx context.Context, call model.ToolCall, result tool.Result) {
+				a.collectSearchResults(call.Name, result, &state)
+			},
+			BeforeDone: func(emit func(event.Event) bool) bool {
+				if len(state.searchResults) == 0 {
+					return true
+				}
+				logger.Info("Search references emitted",
+					"conversation_id", input.ConversationID,
+					"reference_count", len(state.searchResults),
+				)
+				return emit(event.Reference(tool.MustJSON(state.searchResults), len(state.searchResults)))
+			},
+		}),
+	)
+	if !loop.Stream(ctx, reactruntime.Params{
+		ConversationID: input.ConversationID,
+		RequestID:      input.RequestID,
+		Temperature:    runCfg.temperature,
+		MaxRounds:      runCfg.maxRounds,
+	}, messages, sender.Send) {
 		logger.Warn("\U000026A0 ReAct Agent 未完成即停止",
 			"conversation_id", input.ConversationID,
 			"agent_type", a.agentType,
@@ -233,497 +263,6 @@ func (a *ReactAgent) runAsync(ctx context.Context, input agent.Input, events cha
 	)
 }
 
-// scheduleRounds 是 ReAct 主循环，对应 Java WebSearchReactAgent 的 scheduleRound + finishRound。
-//
-// 一轮的完整流程是：
-//  1. 带着当前 messages 和 tools schema 请求模型流式输出。
-//  2. streamRound 边收 content 边发送 text/thinking 事件，同时收集 tool_calls。
-//  3. 如果本轮没有 tool_calls，说明模型已经给出最终答案，输出 reference + complete 后结束。
-//  4. 如果本轮有 tool_calls，先把 assistant(tool_calls) 放回 messages，再执行工具。
-//  5. 把每个工具结果作为 tool message 追加到 messages，然后进入下一轮。
-//
-// 这个判断和 dodo-agent 保持一致：不是解析自然语言 JSON action，而是依赖模型原生 tool_calls。
-func (a *ReactAgent) scheduleRounds(ctx context.Context, send func(event.Event) bool, conversationID string, requestID string, cfg runConfig, messages []model.Message, agentState *agentState) bool {
-	logger := a.logger
-	if requestID != "" {
-		logger = logger.With("request_id", requestID)
-	}
-	for round := 1; round <= cfg.maxRounds; round++ {
-		roundStartedAt := time.Now()
-		toolDefs := a.modelTools()
-		logger.Info("\U0001F501 ReAct 推理轮次开始",
-			"conversation_id", conversationID,
-			"round", round,
-			"message_count", len(messages),
-			"tool_schema_count", len(toolDefs),
-		)
-
-		if !send(event.Thinking(fmt.Sprintf("ReAct round %d started\n", round))) {
-			return false
-		}
-
-		// streamRound 只负责“跑一轮模型流”：它不会执行工具，也不会决定是否继续下一轮。
-		// 轮次结束后的模式判断统一放在 scheduleRounds，方便和 Java finishRound 对齐。
-		state, ok := a.streamRound(ctx, send, conversationID, requestID, cfg.temperature, round, messages, toolDefs)
-		if !ok {
-			logger.Warn("\U000026A0 ReAct 推理轮次被中断",
-				"conversation_id", conversationID,
-				"round", round,
-				"elapsed_ms", elapsedMillis(roundStartedAt),
-				"error", ctx.Err(),
-			)
-			return false
-		}
-
-		// Java finishRound 的关键语义：本轮没有 tool_call，就把本轮文本视为最终答案。
-		if len(state.toolCalls) == 0 {
-			logger.Info("\U0001F3AF 当前轮次判定为最终回答",
-				"conversation_id", conversationID,
-				"round", round,
-				"content_chars", state.textBuffer.Len(),
-				"final_answer_chars", state.textBuffer.Len(),
-				"final_answer_preview", previewText(state.textBuffer.String(), 80),
-				"elapsed_ms", elapsedMillis(roundStartedAt),
-			)
-			return a.finishFinal(send, conversationID, requestID, agentState)
-		}
-
-		logger.Info("\U0001F6E0 当前轮次进入工具调用模式",
-			"conversation_id", conversationID,
-			"round", round,
-			"tool_call_count", len(state.toolCalls),
-			"content_chars", state.textBuffer.Len(),
-			"elapsed_ms", elapsedMillis(roundStartedAt),
-		)
-
-		// 先把 assistant tool_calls 放回上下文，再执行工具并追加 tool response。
-		messages = append(messages, model.Message{
-			Role:      model.RoleAssistant,
-			Content:   state.textBuffer.String(),
-			ToolCalls: state.toolCalls,
-		})
-
-		if round >= cfg.maxRounds {
-			// 已经达到最大轮次时不能再执行工具，否则可能继续触发下一轮工具调用。
-			// 这里追加一条 user 指令，强制模型基于已有上下文直接总结最终答案。
-			logger.Warn("\U000026A0 已达到最大推理轮次，强制进入最终回答",
-				"conversation_id", conversationID,
-				"round", round,
-				"max_rounds", cfg.maxRounds,
-			)
-			if !send(event.Thinking("Max reasoning rounds reached, forcing final answer\n")) {
-				return false
-			}
-			messages = append(messages, model.Message{
-				Role:    model.RoleUser,
-				Content: "The maximum reasoning rounds have been reached. Based on the current context, produce the final answer directly. Do not call tools again.",
-			})
-			return a.forceFinalStream(ctx, send, conversationID, requestID, cfg.temperature, messages, agentState)
-		}
-
-		// 工具执行结果必须以 tool role message 追加回上下文。
-		// 下一轮模型才能看到“工具已经返回了什么”，并据此继续推理或生成最终答案。
-		toolResponses, ok := a.executeToolCalls(ctx, send, conversationID, requestID, round, state.toolCalls, agentState)
-		if !ok {
-			logger.Warn("\U000026A0 工具执行流程被中断",
-				"conversation_id", conversationID,
-				"round", round,
-				"error", ctx.Err(),
-			)
-			return false
-		}
-		messages = append(messages, toolResponses...)
-	}
-
-	return a.finishFinal(send, conversationID, requestID, agentState)
-}
-
-// streamRound 执行单个 ReAct 轮次里的模型流读取，对应 Java 的 processChunk。
-//
-// 它的职责边界非常明确：
-//   - 看到文本 content：解析 <think> 标签，thinking 片段发 thinking 事件，正文发 text 事件并写入 textBuffer。
-//   - 看到 tool_calls：进入工具调用模式，只合并 tool call，不立刻执行工具。
-//   - 看到错误或取消：发送 error 事件并返回 ok=false。
-//
-// 注意：OpenAI-compatible 的 tool_calls 是流式 delta，function.arguments 可能被拆成多个 chunk。
-// 因此这里不能把单个 chunk 当作完整工具调用，必须交给 roundState.mergeToolCall 合并。
-func (a *ReactAgent) streamRound(ctx context.Context, send func(event.Event) bool, conversationID string, requestID string, temperature float64, round int, messages []model.Message, toolDefs []model.ToolDefinition) (roundState, bool) {
-	startedAt := time.Now()
-	logger := a.logger
-	if requestID != "" {
-		logger = logger.With("request_id", requestID)
-	}
-	logger.Info("\U0001F9E0 开始请求模型流式输出",
-		"conversation_id", conversationID,
-		"round", round,
-		"message_count", len(messages),
-		"tool_schema_count", len(toolDefs),
-	)
-
-	stream, err := a.model.Stream(ctx, model.Request{
-		Temperature: temperature,
-		Messages:    messages,
-		Tools:       toolDefs,
-		RequestID:   requestID,
-	})
-	if err != nil {
-		logger.Error("\U0000274C 模型流启动失败",
-			"conversation_id", conversationID,
-			"round", round,
-			"elapsed_ms", elapsedMillis(startedAt),
-			"error", err,
-		)
-		_ = send(event.Error("LLM_CALL_FAILED", "model stream failed to start", err.Error()))
-		return roundState{}, false
-	}
-
-	state := roundState{}
-	chunkCount := 0
-	textChunkCount := 0
-	thinkingChars := 0
-	toolDeltaCount := 0
-	firstChunkMs := int64(-1)
-	firstTextMs := int64(-1)
-	firstToolDeltaMs := int64(-1)
-	for chunk := range stream {
-		// 模型层把 HTTP/Scanner/JSON 错误包装到 chunk.Err，Agent 层负责转成 SSE error。
-		if chunk.Err != nil {
-			logger.Error("\U0000274C 模型流读取失败",
-				"conversation_id", conversationID,
-				"round", round,
-				"chunk_count", chunkCount,
-				"content_chars", state.textBuffer.Len(),
-				"tool_delta_count", toolDeltaCount,
-				"elapsed_ms", elapsedMillis(startedAt),
-				"error", chunk.Err,
-			)
-			_ = send(event.Error("LLM_CALL_FAILED", "model stream failed", chunk.Err.Error()))
-			return state, false
-		}
-		if chunk.Done {
-			break
-		}
-		if firstChunkMs < 0 {
-			firstChunkMs = elapsedMillis(startedAt)
-		}
-		chunkCount++
-		if len(chunk.ToolCalls) > 0 {
-			// 一旦发现 tool_calls，本轮就被标记为工具模式。
-			// 后续即使模型又输出文本，也不应该把这轮当最终答案。
-			state.mode = roundModeToolCall
-			toolDeltaCount += len(chunk.ToolCalls)
-			if firstToolDeltaMs < 0 {
-				firstToolDeltaMs = elapsedMillis(startedAt)
-			}
-			for _, incoming := range chunk.ToolCalls {
-				state.mergeToolCall(incoming)
-			}
-			continue
-		}
-		if chunk.Content != "" {
-			textChunkCount++
-			if firstTextMs < 0 {
-				firstTextMs = elapsedMillis(startedAt)
-			}
-			// dodo-agent 会解析 <think> 标签，把思考过程和答案正文分开推给前端。
-			// Go 版保持同样语义，并且 inThink 可以跨 chunk 延续。
-			for _, segment := range parseThinkSegments(chunk.Content, &state.inThink) {
-				if segment.thinking {
-					thinkingChars += len(segment.content)
-					if !send(event.Thinking(segment.content)) {
-						return state, false
-					}
-				} else {
-					if !send(event.Text(segment.content)) {
-						return state, false
-					}
-					state.textBuffer.WriteString(segment.content)
-				}
-			}
-		}
-	}
-
-	logger.Info("\U00002705 模型流读取完成",
-		"conversation_id", conversationID,
-		"round", round,
-		"chunk_count", chunkCount,
-		"text_chunk_count", textChunkCount,
-		"content_chars", state.textBuffer.Len(),
-		"thinking_chars", thinkingChars,
-		"tool_delta_count", toolDeltaCount,
-		"tool_call_count", len(state.toolCalls),
-		"mode", state.modeForLog(),
-		"first_chunk_ms", firstChunkMs,
-		"first_text_ms", firstTextMs,
-		"first_tool_delta_ms", firstToolDeltaMs,
-		"elapsed_ms", elapsedMillis(startedAt),
-	)
-	return state, true
-}
-
-// executeToolCalls 执行本轮模型请求的所有工具调用，对应 Java 的 executeToolCalls。
-//
-// 每个工具调用都会产生一对前端事件：
-//  1. tool_start：告诉前端工具名称、tool_call_id、arguments。
-//  2. tool_end：告诉前端工具结果，失败时也以 tool_end 返回错误 JSON，保证模型上下文闭环。
-//
-// 返回值是要追加到 messages 的 tool role message。顺序保持和模型 tool_calls 顺序一致。
-func (a *ReactAgent) executeToolCalls(ctx context.Context, send func(event.Event) bool, conversationID string, requestID string, round int, calls []model.ToolCall, agentState *agentState) ([]model.Message, bool) {
-	batchStartedAt := time.Now()
-	logger := a.logger
-	if requestID != "" {
-		logger = logger.With("request_id", requestID)
-	}
-	logger.Info("\U0001F6E0 开始执行本轮工具调用批次",
-		"conversation_id", conversationID,
-		"round", round,
-		"tool_call_count", len(calls),
-	)
-
-	responses := make([]model.Message, 0, len(calls))
-	for _, call := range calls {
-		callStartedAt := time.Now()
-		toolName := call.Name
-		argsJSON := call.Arguments
-		if strings.Contains(toolName, "search") {
-			// 搜索类工具执行前额外发 thinking，让前端能展示“正在搜索”状态。
-			query := extractQuery(argsJSON)
-			if query != "" {
-				if !send(event.Thinking("Searching information: " + query + "\n")) {
-					return nil, false
-				}
-			} else if !send(event.Thinking("Searching related information\n")) {
-				return nil, false
-			}
-		}
-
-		// tool_start 必须早于真正执行工具；这样慢工具也能在前端看到进度。
-		if !send(event.ToolStart(toolName, call.ID, argsJSON)) {
-			return nil, false
-		}
-
-		logger.Info("\U0001F527 工具调用开始",
-			"conversation_id", conversationID,
-			"round", round,
-			"tool", toolName,
-			"tool_call_id", call.ID,
-			"args_chars", len(argsJSON),
-			"args_summary", toolArgsSummary(argsJSON),
-		)
-
-		// 模型给出的 arguments 是 JSON 字符串；本地工具运行时使用 map[string]any。
-		args := map[string]any{}
-		if strings.TrimSpace(argsJSON) != "" {
-			if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
-				result := `{ "error": "invalid tool arguments: ` + escapeForJSON(err.Error()) + `" }`
-				logger.Error("\U0000274C 工具参数解析失败",
-					"conversation_id", conversationID,
-					"round", round,
-					"tool", toolName,
-					"tool_call_id", call.ID,
-					"args_chars", len(argsJSON),
-					"elapsed_ms", elapsedMillis(callStartedAt),
-					"error", err,
-				)
-				if !send(event.ToolEnd(toolName, call.ID, result)) {
-					return nil, false
-				}
-				// 即使参数错误，也要把错误作为 tool response 追加回模型上下文。
-				// 否则下一轮模型会认为这个 tool_call 没有对应响应。
-				responses = append(responses, toolResponse(call, result))
-				continue
-			}
-		}
-
-		result, err := a.tools.Execute(ctx, toolName, args)
-		if err != nil {
-			resultText := `{ "error": "` + escapeForJSON(err.Error()) + `" }`
-			logger.Error("\U0000274C 工具调用失败",
-				"conversation_id", conversationID,
-				"round", round,
-				"tool", toolName,
-				"tool_call_id", call.ID,
-				"elapsed_ms", elapsedMillis(callStartedAt),
-				"error", err,
-			)
-			if !send(event.ToolEnd(toolName, call.ID, resultText)) {
-				return nil, false
-			}
-			// 工具运行失败同样返回 tool response，让模型有机会解释失败原因或换策略。
-			responses = append(responses, toolResponse(call, resultText))
-			continue
-		}
-
-		// 搜索工具的结构化结果会被收集到 agentState，最终作为 reference 事件输出。
-		a.collectSearchResults(toolName, result, agentState)
-		resultText := result.Content
-		if result.Data != nil {
-			resultText = tool.MustJSON(result.Data)
-		}
-		logger.Info("\U00002705 工具调用完成",
-			"conversation_id", conversationID,
-			"round", round,
-			"tool", toolName,
-			"tool_call_id", call.ID,
-			"result_chars", len(resultText),
-			"search_reference_count", len(agentState.searchResults),
-			"elapsed_ms", elapsedMillis(callStartedAt),
-		)
-		if !send(event.ToolEnd(toolName, call.ID, resultText)) {
-			return nil, false
-		}
-		// tool response 的 ToolCallID 必须和 assistant tool_call.ID 一致，这是 OpenAI tool 协议要求。
-		responses = append(responses, toolResponse(call, resultText))
-	}
-
-	logger.Info("\U00002705 本轮工具调用批次完成",
-		"conversation_id", conversationID,
-		"round", round,
-		"tool_response_count", len(responses),
-		"reference_count", len(agentState.searchResults),
-		"elapsed_ms", elapsedMillis(batchStartedAt),
-	)
-	return responses, true
-}
-
-// forceFinalStream 在达到 maxRounds 后触发，强制模型停止工具调用并输出最终答案。
-//
-// 正常 ReAct 是“模型决定是否继续调用工具”；但为了防止无限循环，超过最大轮次后：
-//   - 不再传 Tools 给模型；
-//   - 追加一条 user message，明确要求直接总结；
-//   - 流式输出仍然复用 text/thinking 事件协议。
-func (a *ReactAgent) forceFinalStream(ctx context.Context, send func(event.Event) bool, conversationID string, requestID string, temperature float64, messages []model.Message, agentState *agentState) bool {
-	startedAt := time.Now()
-	logger := a.logger
-	if requestID != "" {
-		logger = logger.With("request_id", requestID)
-	}
-	logger.Info("\U0001F9E0 开始请求强制最终回答模型流",
-		"conversation_id", conversationID,
-		"message_count", len(messages),
-	)
-
-	stream, err := a.model.Stream(ctx, model.Request{
-		Temperature: temperature,
-		Messages:    messages,
-		RequestID:   requestID,
-	})
-	if err != nil {
-		logger.Error("\U0000274C 强制最终回答模型流启动失败",
-			"conversation_id", conversationID,
-			"elapsed_ms", elapsedMillis(startedAt),
-			"error", err,
-		)
-		_ = send(event.Error("LLM_CALL_FAILED", "force final stream failed to start", err.Error()))
-		return false
-	}
-
-	state := roundState{}
-	chunkCount := 0
-	textChars := 0
-	thinkingChars := 0
-	firstChunkMs := int64(-1)
-	firstTextMs := int64(-1)
-	var finalText strings.Builder
-	for chunk := range stream {
-		if chunk.Err != nil {
-			logger.Error("\U0000274C 强制最终回答模型流读取失败",
-				"conversation_id", conversationID,
-				"chunk_count", chunkCount,
-				"text_chars", textChars,
-				"thinking_chars", thinkingChars,
-				"elapsed_ms", elapsedMillis(startedAt),
-				"error", chunk.Err,
-			)
-			_ = send(event.Error("LLM_CALL_FAILED", "force final stream failed", chunk.Err.Error()))
-			return false
-		}
-		if chunk.Done {
-			break
-		}
-		if firstChunkMs < 0 {
-			firstChunkMs = elapsedMillis(startedAt)
-		}
-		chunkCount++
-		for _, segment := range parseThinkSegments(chunk.Content, &state.inThink) {
-			if segment.thinking {
-				thinkingChars += len(segment.content)
-				if !send(event.Thinking(segment.content)) {
-					return false
-				}
-			} else {
-				textChars += len(segment.content)
-				finalText.WriteString(segment.content)
-				if firstTextMs < 0 {
-					firstTextMs = elapsedMillis(startedAt)
-				}
-				if !send(event.Text(segment.content)) {
-					return false
-				}
-			}
-		}
-	}
-
-	logger.Info("\U00002705 强制最终回答模型流读取完成",
-		"conversation_id", conversationID,
-		"chunk_count", chunkCount,
-		"text_chars", textChars,
-		"thinking_chars", thinkingChars,
-		"first_chunk_ms", firstChunkMs,
-		"first_text_ms", firstTextMs,
-		"final_answer_chars", finalText.Len(),
-		"final_answer_preview", previewText(finalText.String(), 80),
-		"elapsed_ms", elapsedMillis(startedAt),
-	)
-	return a.finishFinal(send, conversationID, requestID, agentState)
-}
-
-// finishFinal 是 Agent 最终收口点。
-//
-// 输出顺序保持稳定：
-//  1. 如果搜索工具收集到了引用，先发 reference。
-//  2. 最后发 complete，通知 HTTP/SSE 层可以正常关闭。
-//
-// 注意最终答案正文不是在这里发的；正文已经在 streamRound/forceFinalStream 中边生成边发 text。
-func (a *ReactAgent) finishFinal(send func(event.Event) bool, conversationID string, requestID string, state *agentState) bool {
-	logger := a.logger
-	if requestID != "" {
-		logger = logger.With("request_id", requestID)
-	}
-	if len(state.searchResults) > 0 {
-		logger.Info("\U0001F4DA 已输出搜索引用", "conversation_id", conversationID, "reference_count", len(state.searchResults))
-		if !send(event.Reference(tool.MustJSON(state.searchResults), len(state.searchResults))) {
-			return false
-		}
-	}
-	logger.Info("\U0001F3C1 已输出 complete 事件", "conversation_id", conversationID, "reference_count", len(state.searchResults))
-	_ = send(event.Complete())
-	return true
-}
-
-// modelTools 把本地工具注册表转换成模型请求里的 tools schema。
-//
-// Java dodo-agent 通过 Spring AI 的 ToolCallback 暴露工具；
-// Go 版在这里显式生成 OpenAI-compatible 的 tool definition，
-// 让模型能够在流式响应中返回原生 tool_calls。
-func (a *ReactAgent) modelTools() []model.ToolDefinition {
-	if a.tools == nil {
-		return nil
-	}
-	defs := a.tools.Definitions()
-	out := make([]model.ToolDefinition, 0, len(defs))
-	for _, def := range defs {
-		out = append(out, model.ToolDefinition{
-			Name:        def.Name,
-			Description: def.Description,
-			Schema:      def.Schema,
-		})
-	}
-	return out
-}
-
-// loadHistory 从 Memory Runtime 加载最近问答。
-// 真正是否追加到 prompt、保留多少条，由 Context Runtime 统一决定。
 func (a *ReactAgent) loadHistory(ctx context.Context, logger *slog.Logger, conversationID string) []model.Message {
 	if strings.TrimSpace(conversationID) == "" || a.memory == nil || a.maxHistoryRecords <= 0 {
 		return nil
@@ -888,73 +427,6 @@ func (a *ReactAgent) collectSearchResults(toolName string, result tool.Result, s
 	state.searchResults = append(state.searchResults, searchResultsFromAny(raw)...)
 }
 
-// toolResponse 把工具执行结果包装成模型协议要求的 tool role message。
-// 这是下一轮模型能“看见工具结果”的关键消息。
-func toolResponse(call model.ToolCall, content string) model.Message {
-	return model.Message{
-		Role:       model.RoleTool,
-		Content:    content,
-		Name:       call.Name,
-		ToolCallID: call.ID,
-	}
-}
-
-type roundMode string
-
-const (
-	// roundModeUnknown 表示当前轮没有发现工具调用，通常会走最终答案分支。
-	roundModeUnknown roundMode = "unknown"
-	// roundModeToolCall 表示本轮模型输出了 tool_calls，需要执行工具后进入下一轮。
-	roundModeToolCall roundMode = "tool_call"
-)
-
-// roundState 保存单个 ReAct 轮次内的临时状态。
-// 它对应 Java dodo-agent 的 RoundState：mode/textBuffer/toolCalls/inThink。
-type roundState struct {
-	// mode 标记当前轮是否进入工具调用模式。
-	mode roundMode
-	// textBuffer 只收集非 thinking 的正文；如果没有 tool_call，它就是最终答案。
-	textBuffer strings.Builder
-	// toolCalls 保存本轮合并后的模型原生工具调用。
-	toolCalls []model.ToolCall
-	// inThink 表示上一个 chunk 是否停留在 <think> 标签内部，用于跨 chunk 解析。
-	inThink bool
-}
-
-func (s roundState) modeForLog() roundMode {
-	if s.mode == "" {
-		return roundModeUnknown
-	}
-	return s.mode
-}
-
-func (s *roundState) mergeToolCall(incoming model.ToolCall) {
-	for i := range s.toolCalls {
-		existing := &s.toolCalls[i]
-		if sameToolCall(*existing, incoming) {
-			if incoming.ID != "" {
-				existing.ID = incoming.ID
-			}
-			if incoming.Name != "" {
-				existing.Name = incoming.Name
-			}
-			// OpenAI-compatible 流式响应会把 function.arguments 拆成多个 delta，这里按顺序拼回完整 JSON。
-			existing.Arguments += incoming.Arguments
-			return
-		}
-	}
-	s.toolCalls = append(s.toolCalls, incoming)
-}
-
-// sameToolCall 判断两个流式 delta 是否属于同一个工具调用。
-// 有 ID 时优先用 ID；早期 delta 可能没有 ID，因此回退到 index。
-func sameToolCall(left, right model.ToolCall) bool {
-	if left.ID != "" && right.ID != "" {
-		return left.ID == right.ID
-	}
-	return left.Index == right.Index
-}
-
 type agentState struct {
 	// searchResults 跨轮次保存搜索结果，最终在 complete 前输出 reference 事件。
 	searchResults []tool.SearchResult
@@ -1024,79 +496,6 @@ func (r *runRecord) toolsString() string {
 	return strings.Join(names, ",")
 }
 
-type thinkSegment struct {
-	// thinking=true 表示该片段来自 <think> 标签内部。
-	thinking bool
-	// content 是已经剥离 think 标签后的文本片段。
-	content string
-}
-
-// parseThinkSegments 把模型文本按 <think> 标签切成 thinking/text 两类片段。
-// inThink 是指针，因为 <think> 和 </think> 可能分布在不同流式 chunk 中。
-func parseThinkSegments(chunk string, inThink *bool) []thinkSegment {
-	if chunk == "" {
-		return nil
-	}
-
-	const startTag = "<think"
-	const endTag = "</think"
-
-	var segments []thinkSegment
-	currentInThink := *inThink
-	index := 0
-
-	for index < len(chunk) {
-		start := strings.Index(chunk[index:], startTag)
-		end := strings.Index(chunk[index:], endTag)
-		if start >= 0 {
-			start += index
-		}
-		if end >= 0 {
-			end += index
-		}
-
-		if start < 0 && end < 0 {
-			segments = append(segments, thinkSegment{thinking: currentInThink, content: chunk[index:]})
-			break
-		}
-
-		next := start
-		isStart := true
-		if next < 0 || (end >= 0 && end < next) {
-			next = end
-			isStart = false
-		}
-
-		if next > index {
-			segments = append(segments, thinkSegment{thinking: currentInThink, content: chunk[index:next]})
-		}
-
-		tagEnd := strings.Index(chunk[next:], ">")
-		if tagEnd < 0 {
-			currentInThink = isStart
-			break
-		}
-		currentInThink = isStart
-		index = next + tagEnd + 1
-	}
-
-	*inThink = currentInThink
-	return segments
-}
-
-// extractQuery 只用于搜索工具的 thinking 提示，不参与工具执行本身。
-func extractQuery(argsJSON string) string {
-	var args map[string]any
-	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
-		return ""
-	}
-	value, ok := args["query"]
-	if !ok {
-		return ""
-	}
-	return strings.TrimSpace(fmt.Sprint(value))
-}
-
 // searchResultsFromAny 把工具返回的 results 字段转换成统一 SearchResult 切片。
 // mock 工具和真实 web_search 工具可能返回不同的动态类型，因此这里做兼容转换。
 func searchResultsFromAny(value any) []tool.SearchResult {
@@ -1120,48 +519,6 @@ func searchResultsFromAny(value any) []tool.SearchResult {
 	default:
 		return nil
 	}
-}
-
-// escapeForJSON 用于把错误文本安全塞进简短 JSON 字符串。
-func escapeForJSON(value string) string {
-	payload, err := json.Marshal(value)
-	if err != nil {
-		return value
-	}
-	trimmed := string(payload)
-	return strings.Trim(trimmed, `"`)
-}
-
-// toolArgsSummary 给日志输出短参数摘要，避免完整 arguments 太长或包含敏感内容。
-func toolArgsSummary(argsJSON string) string {
-	if strings.TrimSpace(argsJSON) == "" {
-		return ""
-	}
-	var args map[string]any
-	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
-		return "invalid_json"
-	}
-	preferred := []string{"query", "timezone", "city"}
-	parts := make([]string, 0, len(preferred))
-	for _, key := range preferred {
-		if value, ok := args[key]; ok {
-			parts = append(parts, key+"="+previewText(fmt.Sprint(value), 60))
-		}
-	}
-	if len(parts) > 0 {
-		return strings.Join(parts, ",")
-	}
-	return fmt.Sprintf("keys=%d", len(args))
-}
-
-// previewText 压缩空白并截断文本，用于日志中的最终回答预览。
-func previewText(value string, limit int) string {
-	normalized := strings.Join(strings.Fields(value), " ")
-	if limit <= 0 || len([]rune(normalized)) <= limit {
-		return normalized
-	}
-	runes := []rune(normalized)
-	return string(runes[:limit]) + "..."
 }
 
 func elapsedMillis(startedAt time.Time) int64 {

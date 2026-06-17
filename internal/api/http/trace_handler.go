@@ -8,9 +8,9 @@ import (
 	"strings"
 	"time"
 
+	"agentG/internal/runtime/event"
+	"agentG/internal/runtime/trace"
 	"github.com/go-chi/chi/v5"
-	"github.com/learn-demo/agent-go/internal/runtime/event"
-	"github.com/learn-demo/agent-go/internal/runtime/trace"
 )
 
 // TraceHandler 提供 trace 查询和 SSE 回放接口。

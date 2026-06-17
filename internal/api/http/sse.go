@@ -7,7 +7,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/learn-demo/agent-go/internal/runtime/event"
+	"agentG/internal/runtime/event"
 )
 
 type StreamSummary struct {

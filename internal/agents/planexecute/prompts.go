@@ -5,7 +5,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/learn-demo/agent-go/internal/runtime/tool"
+	"agentG/internal/runtime/tool"
 )
 
 func clarifyPrompt(now time.Time) string {

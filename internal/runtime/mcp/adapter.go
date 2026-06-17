@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/learn-demo/agent-go/internal/runtime/tool"
+	"agentG/internal/runtime/tool"
 )
 
 var invalidToolNameChar = regexp.MustCompile(`[^A-Za-z0-9_-]+`)

@@ -3,7 +3,7 @@ package agent
 import (
 	"context"
 
-	"github.com/learn-demo/agent-go/internal/runtime/event"
+	"agentG/internal/runtime/event"
 )
 
 // Input is the per-request context passed from the HTTP layer to an Agent.

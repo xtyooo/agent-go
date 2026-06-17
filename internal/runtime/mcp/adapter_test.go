@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/learn-demo/agent-go/internal/runtime/tool"
+	"agentG/internal/runtime/tool"
 )
 
 type fakeCaller struct {

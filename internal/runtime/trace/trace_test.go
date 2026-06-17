@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/learn-demo/agent-go/internal/runtime/event"
+	"agentG/internal/runtime/event"
 )
 
 func TestFileStoreRecordsAndLoadsTrace(t *testing.T) {

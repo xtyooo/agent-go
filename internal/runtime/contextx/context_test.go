@@ -3,7 +3,7 @@ package contextx
 import (
 	"testing"
 
-	"github.com/learn-demo/agent-go/internal/runtime/model"
+	"agentG/internal/runtime/model"
 )
 
 func TestTrimHistoryKeepsRecentMessages(t *testing.T) {

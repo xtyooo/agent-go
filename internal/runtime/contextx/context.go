@@ -4,7 +4,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/learn-demo/agent-go/internal/runtime/model"
+	"agentG/internal/runtime/model"
 )
 
 // SectionName 标识 prompt 中的一类上下文来源。

@@ -7,8 +7,8 @@ import (
 	"strings"
 	"time"
 
+	"agentG/internal/runtime/memory"
 	"github.com/go-chi/chi/v5"
-	"github.com/learn-demo/agent-go/internal/runtime/memory"
 )
 
 type SessionHandler struct {

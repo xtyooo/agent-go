@@ -6,14 +6,14 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/learn-demo/agent-go/internal/agents/websearch"
-	"github.com/learn-demo/agent-go/internal/runtime/agent"
-	"github.com/learn-demo/agent-go/internal/runtime/contextx"
-	"github.com/learn-demo/agent-go/internal/runtime/event"
-	"github.com/learn-demo/agent-go/internal/runtime/memory"
-	"github.com/learn-demo/agent-go/internal/runtime/model"
-	"github.com/learn-demo/agent-go/internal/runtime/skill"
-	"github.com/learn-demo/agent-go/internal/runtime/tool"
+	"agentG/internal/agents/websearch"
+	"agentG/internal/runtime/agent"
+	"agentG/internal/runtime/contextx"
+	"agentG/internal/runtime/event"
+	"agentG/internal/runtime/memory"
+	"agentG/internal/runtime/model"
+	"agentG/internal/runtime/skill"
+	"agentG/internal/runtime/tool"
 )
 
 // Agent 是 Skills React Agent 的薄封装。

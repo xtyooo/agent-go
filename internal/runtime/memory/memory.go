@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/learn-demo/agent-go/internal/runtime/model"
+	"agentG/internal/runtime/model"
 )
 
 // SessionRecord 对应 Java dodo-agent 的 AiSession，也对应数据库表 ai_session。

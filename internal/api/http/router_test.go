@@ -9,8 +9,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/learn-demo/agent-go/internal/runtime/memory"
-	"github.com/learn-demo/agent-go/internal/runtime/task"
+	"agentG/internal/runtime/memory"
+	"agentG/internal/runtime/task"
 )
 
 func TestRouterServesWebAppAndOptions(t *testing.T) {

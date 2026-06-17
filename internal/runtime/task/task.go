@@ -8,7 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/learn-demo/agent-go/internal/runtime/event"
+	"agentG/internal/runtime/event"
 )
 
 const stopEventWriteTimeout = 2 * time.Second

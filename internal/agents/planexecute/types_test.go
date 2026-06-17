@@ -3,7 +3,7 @@ package planexecute
 import (
 	"testing"
 
-	"github.com/learn-demo/agent-go/internal/runtime/tool"
+	"agentG/internal/runtime/tool"
 )
 
 func TestParseTasksAcceptsMarkdownJSONAndStripsThinkTags(t *testing.T) {

@@ -10,10 +10,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/learn-demo/agent-go/internal/runtime/agent"
-	"github.com/learn-demo/agent-go/internal/runtime/event"
-	"github.com/learn-demo/agent-go/internal/runtime/task"
-	"github.com/learn-demo/agent-go/internal/runtime/trace"
+	"agentG/internal/runtime/agent"
+	"agentG/internal/runtime/event"
+	"agentG/internal/runtime/task"
+	"agentG/internal/runtime/trace"
 )
 
 type AgentHandler struct {

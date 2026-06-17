@@ -1,4 +1,4 @@
-module github.com/learn-demo/agent-go
+module agentG
 
 go 1.26.2
 
