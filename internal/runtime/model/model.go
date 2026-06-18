@@ -42,7 +42,10 @@ type Request struct {
 	// MaxTokens 为 0 时不显式限制，由模型服务使用默认值。
 	MaxTokens int
 	// RequestID 仅用于日志链路追踪，不会发送给模型。
-	RequestID string
+	RequestID      string
+	TraceID        string
+	ConversationID string
+	AgentType      string
 }
 
 // Response 是非流式 Generate 的完整结果。
@@ -51,6 +54,7 @@ type Response struct {
 	Content string
 	// ToolCalls 是模型一次性返回的原生工具调用。
 	ToolCalls []ToolCall
+	Usage     Usage
 }
 
 // Chunk 是模型流式输出的最小单位。
@@ -58,12 +62,31 @@ type Response struct {
 type Chunk struct {
 	// Content 是本次 delta 的文本片段。
 	Content string
+	// ReasoningContent is provider-native reasoning text when the model exposes it.
+	ReasoningContent string
 	// ToolCalls 是本次 delta 的工具调用片段，arguments 可能跨 chunk 拆分。
 	ToolCalls []ToolCall
 	// Done 表示流式响应正常结束。
 	Done bool
 	// Err 表示读取、解析或上游请求失败。
-	Err error
+	Err   error
+	Usage Usage
+}
+
+type Usage struct {
+	PromptTokens     int
+	CompletionTokens int
+	TotalTokens      int
+	CachedTokens     int
+	ReasoningTokens  int
+}
+
+func (u Usage) Empty() bool {
+	return u.PromptTokens == 0 &&
+		u.CompletionTokens == 0 &&
+		u.TotalTokens == 0 &&
+		u.CachedTokens == 0 &&
+		u.ReasoningTokens == 0
 }
 
 // ToolDefinition 是暴露给模型的工具 schema。

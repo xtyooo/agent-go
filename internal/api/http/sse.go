@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"agentG/internal/runtime/event"
+	"agentG/internal/runtime/task"
 )
 
 type StreamSummary struct {
@@ -124,6 +125,62 @@ func WriteSSEEvent(w http.ResponseWriter, evt event.Event) {
 	writeSSE(w, evt)
 	if flusher, ok := w.(http.Flusher); ok {
 		flusher.Flush()
+	}
+}
+
+func StreamTaskRecords(w http.ResponseWriter, r *http.Request, records <-chan task.EventRecord, logger *slog.Logger, conversationID string, requestID string, options StreamOptions) StreamSummary {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	if requestID != "" {
+		logger = logger.With("request_id", requestID)
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		logger.Error("current response writer does not support SSE streaming", "conversation_id", conversationID)
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return newStreamSummary()
+	}
+
+	startedAt := time.Now()
+	summary := newStreamSummary()
+	logger.Info("task SSE stream opened", "conversation_id", conversationID)
+
+	for {
+		select {
+		case <-r.Context().Done():
+			logger.Warn("task SSE stream was closed by client",
+				"conversation_id", conversationID,
+				"event_count", summary.EventCount,
+				"first_event_ms", summary.FirstEventMs,
+				"elapsed_ms", elapsedMillis(startedAt),
+				"error", r.Context().Err(),
+			)
+			return summary
+		case record, ok := <-records:
+			if !ok {
+				logger.Info("task SSE stream closed",
+					"conversation_id", conversationID,
+					"event_count", summary.EventCount,
+					"first_event_ms", summary.FirstEventMs,
+					"elapsed_ms", elapsedMillis(startedAt),
+				)
+				return summary
+			}
+			evt := record.Event
+			recordEvent(&summary, evt, startedAt)
+			if options.Observer != nil {
+				options.Observer(evt)
+			}
+			writeSSE(w, evt)
+			flusher.Flush()
+		}
 	}
 }
 

@@ -13,6 +13,7 @@ import (
 	"agentG/internal/runtime/memory"
 	"agentG/internal/runtime/task"
 	"agentG/internal/runtime/trace"
+	"agentG/internal/runtime/usage"
 	"github.com/go-chi/chi/v5"
 )
 
@@ -29,6 +30,10 @@ func NewRouterWithAgentsAndTrace(logger *slog.Logger, agents map[string]agent.Ag
 }
 
 func NewRouterWithAgentsTraceAndPPTX(logger *slog.Logger, agents map[string]agent.Agent, tasks *task.Manager, store memory.Store, traces trace.Store, pptStore pptx.Store) http.Handler {
+	return NewRouterWithAgentsTracePPTXAndUsage(logger, agents, tasks, store, traces, pptStore, nil)
+}
+
+func NewRouterWithAgentsTracePPTXAndUsage(logger *slog.Logger, agents map[string]agent.Agent, tasks *task.Manager, store memory.Store, traces trace.Store, pptStore pptx.Store, usageStore usage.Store) http.Handler {
 	r := chi.NewRouter()
 	r.Use(corsMiddleware)
 
@@ -36,6 +41,7 @@ func NewRouterWithAgentsTraceAndPPTX(logger *slog.Logger, agents map[string]agen
 	sessionHandler := NewSessionHandler(logger, store)
 	traceHandler := NewTraceHandler(logger, traces)
 	pptxHandler := NewPPTXHandler(logger, pptStore)
+	usageHandler := NewUsageHandler(logger, usageStore)
 
 	r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -48,6 +54,8 @@ func NewRouterWithAgentsTraceAndPPTX(logger *slog.Logger, agents map[string]agen
 		r.Get("/deep/stream", handler.DeepStream)
 		r.Get("/skills/stream", handler.SkillsStream)
 		r.Get("/pptx/stream", handler.PptxStream)
+		r.Get("/status", handler.TaskStatus)
+		r.Get("/attach/stream", handler.TaskAttachStream)
 		r.Get("/stop", handler.StopAgent)
 		r.Post("/stop", handler.StopAgent)
 	})
@@ -77,6 +85,10 @@ func NewRouterWithAgentsTraceAndPPTX(logger *slog.Logger, agents map[string]agen
 		r.Get("/replay/stream", traceHandler.ReplayStream)
 		r.Get("/{traceId}", traceHandler.GetTrace)
 		r.Get("/{traceId}/replay/stream", traceHandler.ReplayStream)
+	})
+
+	r.Route("/usage", func(r chi.Router) {
+		r.Get("/overview", usageHandler.Overview)
 	})
 
 	mountWebApp(r, logger, webDistDir())

@@ -7,6 +7,7 @@ const proxy = {
   "/pptx": apiTarget,
   "/session": apiTarget,
   "/trace": apiTarget,
+  "/usage": apiTarget,
   "/healthz": apiTarget
 };
 

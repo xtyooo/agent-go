@@ -27,11 +27,12 @@ type Hooks struct {
 }
 
 type Loop struct {
-	model     model.Model
-	tools     *tool.Registry
-	maxRounds int
-	logger    *slog.Logger
-	hooks     Hooks
+	model          model.Model
+	tools          *tool.Registry
+	maxRounds      int
+	logger         *slog.Logger
+	hooks          Hooks
+	stageProviders []StageOutputProvider
 }
 
 type Option func(*Loop)
@@ -66,6 +67,12 @@ func WithHooks(hooks Hooks) Option {
 	}
 }
 
+func WithStageProviders(providers ...StageOutputProvider) Option {
+	return func(l *Loop) {
+		l.stageProviders = append(l.stageProviders, providers...)
+	}
+}
+
 func (l *Loop) Stream(ctx context.Context, params Params, messages []model.Message, emit func(event.Event) bool) bool {
 	if emit == nil {
 		emit = func(event.Event) bool { return true }
@@ -83,6 +90,13 @@ func (l *Loop) Stream(ctx context.Context, params Params, messages []model.Messa
 	logger := l.logger
 	if params.RequestID != "" {
 		logger = logger.With("request_id", params.RequestID)
+	}
+
+	if !l.emitStageOutputs(ctx, emit, StageAfterStart, StageContext{
+		Params:   params,
+		Messages: messages,
+	}) {
+		return false
 	}
 
 	for round := 1; round <= params.MaxRounds; round++ {
@@ -118,7 +132,7 @@ func (l *Loop) Stream(ctx context.Context, params Params, messages []model.Messa
 				"final_answer_preview", previewText(state.textBuffer.String(), 80),
 				"elapsed_ms", elapsedMillis(roundStartedAt),
 			)
-			return l.finish(emit)
+			return l.finish(ctx, emit, params, messages)
 		}
 
 		messages = append(messages, model.Message{
@@ -155,7 +169,7 @@ func (l *Loop) Stream(ctx context.Context, params Params, messages []model.Messa
 		messages = append(messages, toolResponses...)
 	}
 
-	return l.finish(emit)
+	return l.finish(ctx, emit, params, messages)
 }
 
 func (l *Loop) streamRound(ctx context.Context, emit func(event.Event) bool, params Params, round int, messages []model.Message, toolDefs []model.ToolDefinition) (roundState, bool) {
@@ -227,6 +241,12 @@ func (l *Loop) streamRound(ctx context.Context, emit func(event.Event) bool, par
 				state.mergeToolCall(incoming)
 			}
 			continue
+		}
+		if chunk.ReasoningContent != "" {
+			thinkingChars += len(chunk.ReasoningContent)
+			if !emit(event.Thinking(chunk.ReasoningContent)) {
+				return state, false
+			}
 		}
 		if chunk.Content == "" {
 			continue
@@ -359,6 +379,14 @@ func (l *Loop) executeToolCalls(ctx context.Context, emit func(event.Event) bool
 		if !emit(event.ToolEnd(toolName, call.ID, resultText)) {
 			return nil, false
 		}
+		if !l.emitStageOutputs(ctx, emit, StageAfterToolEnd, StageContext{
+			Params:     params,
+			Round:      round,
+			ToolCall:   &call,
+			ToolResult: &result,
+		}) {
+			return nil, false
+		}
 		responses = append(responses, ToolResponse(call, resultText))
 	}
 
@@ -424,6 +452,12 @@ func (l *Loop) forceFinalStream(ctx context.Context, emit func(event.Event) bool
 			firstChunkMs = elapsedMillis(startedAt)
 		}
 		chunkCount++
+		if chunk.ReasoningContent != "" {
+			thinkingChars += len(chunk.ReasoningContent)
+			if !emit(event.Thinking(chunk.ReasoningContent)) {
+				return false
+			}
+		}
 		for _, segment := range ParseThinkSegments(chunk.Content, &state.inThink) {
 			if segment.Thinking {
 				thinkingChars += len(segment.Content)
@@ -454,14 +488,39 @@ func (l *Loop) forceFinalStream(ctx context.Context, emit func(event.Event) bool
 		"final_answer_preview", previewText(finalText.String(), 80),
 		"elapsed_ms", elapsedMillis(startedAt),
 	)
-	return l.finish(emit)
+	return l.finish(ctx, emit, params, messages)
 }
 
-func (l *Loop) finish(emit func(event.Event) bool) bool {
+func (l *Loop) finish(ctx context.Context, emit func(event.Event) bool, params Params, messages []model.Message) bool {
+	if !l.emitStageOutputs(ctx, emit, StageBeforeDone, StageContext{
+		Params:   params,
+		Messages: messages,
+	}) {
+		return false
+	}
 	if l.hooks.BeforeDone != nil && !l.hooks.BeforeDone(emit) {
 		return false
 	}
 	return emit(event.Complete())
+}
+
+func (l *Loop) emitStageOutputs(ctx context.Context, emit func(event.Event) bool, timing StageTiming, stageContext StageContext) bool {
+	for _, provider := range l.stageProviders {
+		if provider == nil || provider.Timing() != timing {
+			continue
+		}
+		data, err := provider.Produce(ctx, stageContext)
+		if err != nil {
+			return emit(event.Error("STAGE_OUTPUT_FAILED", "stage output failed", err.Error()))
+		}
+		if data == nil {
+			continue
+		}
+		if !emit(event.StageOutput(provider.Name(), string(timing), data)) {
+			return false
+		}
+	}
+	return true
 }
 
 func (l *Loop) modelTools() []model.ToolDefinition {

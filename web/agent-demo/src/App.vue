@@ -23,6 +23,10 @@
           <Plus :size="18" />
           <span>新聊天</span>
         </button>
+        <button class="nav-item" :class="{ active: activeView === 'usage' }" type="button" @click="openUsageView">
+          <BarChart3 :size="18" />
+          <span>模型用量</span>
+        </button>
         <label class="nav-item nav-search">
           <Search :size="18" />
           <input v-model.trim="sessionKeyword" type="search" placeholder="搜索聊天" @keydown.enter="loadSessions" />
@@ -79,7 +83,7 @@
       </div>
     </aside>
 
-    <main id="chat-main" class="chat-layout" tabindex="-1">
+    <main v-if="activeView === 'chat'" id="chat-main" class="chat-layout" tabindex="-1">
       <header class="chat-header">
         <div class="header-left">
           <button class="icon-button" type="button" title="会话列表" @click="sidebarOpen = !sidebarOpen">
@@ -152,6 +156,11 @@
                 >
                   <span v-if="item.kind !== 'thinking'" :class="['process-dot', item.status]"></span>
                   <span class="process-title">{{ processTitle(item) }}</span>
+                  <span v-if="item.kind === 'thinking' && item.status === 'running'" class="thinking-wave" aria-hidden="true">
+                    <span></span>
+                    <span></span>
+                    <span></span>
+                  </span>
                   <small v-if="processMeta(item)">{{ processMeta(item) }}</small>
                   <ChevronDown class="process-chevron" :size="14" />
                 </button>
@@ -299,6 +308,151 @@
           <span>{{ draft.length }}/4000</span>
         </div>
       </footer>
+    </main>
+
+    <main v-else id="chat-main" class="usage-layout" tabindex="-1">
+      <header class="chat-header usage-header">
+        <div class="header-left">
+          <button class="icon-button" type="button" title="会话列表" @click="sidebarOpen = !sidebarOpen">
+            <PanelLeft :size="20" />
+          </button>
+          <div>
+            <h1>模型用量</h1>
+            <p>输入、输出、缓存命中与最近调用</p>
+          </div>
+        </div>
+        <div class="header-actions">
+          <select v-model="usageRange" class="usage-select" aria-label="时间范围" @change="loadUsageOverview">
+            <option value="1h">1 小时</option>
+            <option value="6h">6 小时</option>
+            <option value="24h">24 小时</option>
+            <option value="7d">7 天</option>
+            <option value="30d">30 天</option>
+          </select>
+          <button class="icon-button" type="button" title="刷新用量" :disabled="usageLoading" @click="loadUsageOverview">
+            <RefreshCw :size="18" />
+          </button>
+        </div>
+      </header>
+
+      <section class="usage-scroll">
+        <div class="usage-board">
+          <div class="usage-toolbar">
+            <label>
+              <span>Agent</span>
+              <select v-model="usageAgentFilter" @change="loadUsageOverview">
+                <option value="">全部</option>
+                <option v-for="agent in usageAgentOptions" :key="agent" :value="agent">{{ usageAgentLabel(agent) }}</option>
+              </select>
+            </label>
+            <label>
+              <span>Model</span>
+              <select v-model="usageModelFilter" @change="loadUsageOverview">
+                <option value="">全部</option>
+                <option v-for="modelName in usageModelOptions" :key="modelName" :value="modelName">{{ modelName }}</option>
+              </select>
+            </label>
+            <p v-if="usageError" class="usage-error">{{ usageError }}</p>
+          </div>
+
+          <div class="usage-kpis" aria-label="模型用量摘要">
+            <article v-for="metric in usageMetrics" :key="metric.label" class="usage-kpi">
+              <span>{{ metric.label }}</span>
+              <strong>{{ metric.value }}</strong>
+              <small>{{ metric.detail }}</small>
+            </article>
+          </div>
+
+          <section class="usage-panel usage-pulse">
+            <div class="usage-section-head">
+              <div>
+                <strong>Token pulse</strong>
+                <span>{{ usageRangeLabel }} · {{ usageTotalCallsLabel }}</span>
+              </div>
+              <div class="usage-legend">
+                <span><i class="legend-input"></i>输入</span>
+                <span><i class="legend-output"></i>输出</span>
+                <span><i class="legend-cache"></i>缓存</span>
+              </div>
+            </div>
+            <div v-if="usageLoading" class="usage-loading" role="status" aria-label="正在加载模型用量">
+              <span></span>
+              <span></span>
+              <span></span>
+            </div>
+            <svg v-else class="usage-chart" viewBox="0 0 720 220" role="img" aria-label="Token 趋势">
+              <g class="usage-grid">
+                <line v-for="tick in 5" :key="tick" x1="0" x2="720" :y1="tick * 40" :y2="tick * 40" />
+              </g>
+              <polyline class="usage-line input" :points="usageLinePoints('promptTokens')" />
+              <polyline class="usage-line output" :points="usageLinePoints('completionTokens')" />
+              <polyline class="usage-line cache" :points="usageLinePoints('cachedTokens')" />
+              <circle
+                v-for="point in usageChartDots"
+                :key="point.key"
+                :class="['usage-dot', point.kind]"
+                :cx="point.x"
+                :cy="point.y"
+                r="3"
+              />
+            </svg>
+            <div class="usage-axis">
+              <span>{{ usageAxisStart }}</span>
+              <span>{{ usageAxisEnd }}</span>
+            </div>
+          </section>
+
+          <section class="usage-grid-panels">
+            <div class="usage-panel">
+              <div class="usage-section-head">
+                <div>
+                  <strong>模型分布</strong>
+                  <span>按 Token 总量排序</span>
+                </div>
+              </div>
+              <div class="usage-table">
+                <div class="usage-table-row head">
+                  <span>模型</span>
+                  <span>调用</span>
+                  <span>输入</span>
+                  <span>输出</span>
+                  <span>缓存</span>
+                </div>
+                <div v-for="modelRow in usageModels" :key="modelRow.model" class="usage-table-row">
+                  <span>{{ modelRow.model || "-" }}</span>
+                  <span>{{ numberCompact(modelRow.callCount) }}</span>
+                  <span>{{ numberCompact(modelRow.promptTokens) }}</span>
+                  <span>{{ numberCompact(modelRow.completionTokens) }}</span>
+                  <span>{{ percent(modelRow.cacheHitRate) }}</span>
+                </div>
+                <div v-if="!usageModels.length" class="empty-state compact">暂无模型用量</div>
+              </div>
+            </div>
+
+            <div class="usage-panel">
+              <div class="usage-section-head">
+                <div>
+                  <strong>最近调用</strong>
+                  <span>最新 100 条模型请求</span>
+                </div>
+              </div>
+              <div class="usage-calls">
+                <article v-for="record in usageRecords" :key="usageRecordKey(record)" class="usage-call">
+                  <div>
+                    <strong>{{ record.model || "-" }}</strong>
+                    <span>{{ usageAgentLabel(record.agentType) }} · {{ record.stream ? "stream" : "sync" }}</span>
+                  </div>
+                  <div>
+                    <strong>{{ numberCompact(record.totalTokens) }}</strong>
+                    <span>{{ formatDateTime(record.createdAt) }}</span>
+                  </div>
+                </article>
+                <div v-if="!usageRecords.length" class="empty-state compact">暂无调用记录</div>
+              </div>
+            </div>
+          </section>
+        </div>
+      </section>
     </main>
 
     <aside class="details-panel" aria-label="运行细节">
@@ -468,6 +622,7 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import {
+  BarChart3,
   Blocks,
   Bot,
   Check,
@@ -491,6 +646,7 @@ import {
   Play,
   Plus,
   Presentation,
+  RefreshCw,
   Search,
   SearchCheck,
   SendHorizontal,
@@ -503,15 +659,18 @@ import {
 } from "@lucide/vue";
 import {
   AGENT_OPTIONS,
+  buildAgentAttachURL,
   buildPPTDownloadURL,
   buildPPTPreviewURL,
   buildTraceReplayURL,
   buildStreamURL,
   deleteSession,
+  fetchAgentStatus,
   fetchPPTLatest,
   fetchTraceDetail,
   fetchSessionDetail,
   fetchSessions,
+  fetchUsageOverview,
   findAgent,
   renameSession,
   stopAgent
@@ -527,7 +686,9 @@ const starterPrompts = [
 ];
 
 const TRACE_ID_PREFIX = "web";
+const ACTIVE_RUN_STORAGE_KEY = "kimo-agent-active-run";
 
+const activeView = ref("chat");
 const sidebarOpen = ref(false);
 const detailsOpen = ref(false);
 const agentPickerOpen = ref(false);
@@ -567,6 +728,19 @@ const pptPreview = ref({
 const scrollPanel = ref(null);
 const composerInput = ref(null);
 const pendingToolCallIds = new Map();
+const usageRange = ref("24h");
+const usageAgentFilter = ref("");
+const usageModelFilter = ref("");
+const usageLoading = ref(false);
+const usageError = ref("");
+const usageOverview = ref({
+  summary: {},
+  series: [],
+  models: [],
+  records: [],
+  agentTypes: [],
+  modelNames: []
+});
 
 const selectedAgent = computed(() => findAgent(agentType.value));
 const activeTitle = computed(() => activeSessionTitle.value || compactText(firstUserMessage.value, "新会话"));
@@ -585,9 +759,70 @@ const lastAssistantText = computed(() => {
   return assistants.at(-1)?.content || "";
 });
 const firstResponseLabel = computed(() => formatDuration(firstResponseMs.value));
+const usageSummary = computed(() => usageOverview.value?.summary || {});
+const usageSeries = computed(() => Array.isArray(usageOverview.value?.series) ? usageOverview.value.series : []);
+const usageModels = computed(() => Array.isArray(usageOverview.value?.models) ? usageOverview.value.models : []);
+const usageRecords = computed(() => Array.isArray(usageOverview.value?.records) ? usageOverview.value.records : []);
+const usageAgentOptions = computed(() => Array.isArray(usageOverview.value?.agentTypes) ? usageOverview.value.agentTypes : []);
+const usageModelOptions = computed(() => Array.isArray(usageOverview.value?.modelNames) ? usageOverview.value.modelNames : []);
+const usageRangeLabel = computed(() => {
+  const labels = { "1h": "最近 1 小时", "6h": "最近 6 小时", "24h": "最近 24 小时", "7d": "最近 7 天", "30d": "最近 30 天" };
+  return labels[usageRange.value] || "最近 24 小时";
+});
+const usageTotalCallsLabel = computed(() => `${numberCompact(usageSummary.value.callCount || 0)} 次调用`);
+const usageMetrics = computed(() => [
+  {
+    label: "调用次数",
+    value: numberCompact(usageSummary.value.callCount || 0),
+    detail: `${numberCompact(usageSummary.value.errorCount || 0)} 次失败`
+  },
+  {
+    label: "Token 总量",
+    value: numberCompact(usageSummary.value.totalTokens || 0),
+    detail: `均值 ${numberCompact(Math.round(usageSummary.value.avgTotalTokens || 0))}`
+  },
+  {
+    label: "输入 Token",
+    value: numberCompact(usageSummary.value.promptTokens || 0),
+    detail: `缓存 ${numberCompact(usageSummary.value.cachedTokens || 0)}`
+  },
+  {
+    label: "输出 Token",
+    value: numberCompact(usageSummary.value.completionTokens || 0),
+    detail: `推理 ${numberCompact(usageSummary.value.reasoningTokens || 0)}`
+  },
+  {
+    label: "缓存命中",
+    value: percent(usageSummary.value.cacheHitRate || 0),
+    detail: "按输入 Token 计算"
+  }
+]);
+const usageAxisStart = computed(() => formatUsageAxis(usageOverview.value?.from));
+const usageAxisEnd = computed(() => formatUsageAxis(usageOverview.value?.to));
+const usageChartMax = computed(() => {
+  const values = usageSeries.value.flatMap((point) => [
+    Number(point.promptTokens || 0),
+    Number(point.completionTokens || 0),
+    Number(point.cachedTokens || 0)
+  ]);
+  return Math.max(1, ...values);
+});
+const usageChartDots = computed(() => {
+  const kinds = [
+    ["promptTokens", "input"],
+    ["completionTokens", "output"],
+    ["cachedTokens", "cache"]
+  ];
+  return kinds.flatMap(([field, kind]) => usageSeries.value.map((point, index) => {
+    const { x, y } = usagePointPosition(point, index, field);
+    return { key: `${kind}-${index}`, kind, x, y };
+  }));
+});
 
 onMounted(async () => {
   await loadSessions();
+  await loadUsageOverview({ silent: true });
+  await restoreActiveRun();
   focusComposer();
 });
 
@@ -596,6 +831,32 @@ onBeforeUnmount(() => {
 });
 
 watch(messages, () => scrollToBottom(), { deep: true });
+
+async function loadUsageOverview(options = {}) {
+  const silent = Boolean(options.silent);
+  if (!silent) usageLoading.value = true;
+  try {
+    if (!silent) usageError.value = "";
+    usageOverview.value = await fetchUsageOverview({
+      range: usageRange.value,
+      agentType: usageAgentFilter.value,
+      model: usageModelFilter.value,
+      limit: 100
+    });
+  } catch (error) {
+    if (!silent) usageError.value = error.message || "模型用量暂时不可用";
+  } finally {
+    if (!silent) usageLoading.value = false;
+  }
+}
+
+function openUsageView() {
+  activeView.value = "usage";
+  sidebarOpen.value = false;
+  detailsOpen.value = false;
+  agentPickerOpen.value = false;
+  loadUsageOverview();
+}
 
 async function loadSessions(options = {}) {
   const silent = Boolean(options.silent);
@@ -629,6 +890,7 @@ function sessionErrorMessage(error) {
 
 async function openSession(sessionId) {
   if (isRunning.value) return;
+  activeView.value = "chat";
   errorText.value = "";
   try {
     const records = await fetchSessionDetail(sessionId);
@@ -715,6 +977,7 @@ function parseReferences(value) {
 
 function startNewConversation() {
   if (isRunning.value) return;
+  activeView.value = "chat";
   closeStream();
   closePPTPreview();
   activeConversationId.value = "";
@@ -815,6 +1078,17 @@ async function sendMessage() {
   firstResponseMs.value = 0;
   streamEvents.value = [];
   pendingToolCallIds.clear();
+  persistActiveRun({
+    conversationId,
+    traceId,
+    query,
+    agentType: agentType.value,
+    title: activeSessionTitle.value,
+    userMessage,
+    assistantMessage,
+    eventCount: 0,
+    startedAt: new Date().toISOString()
+  });
 
   const url = buildStreamURL({
     query,
@@ -834,6 +1108,7 @@ function handleStreamEvent(event) {
     ...event
   };
   streamEvents.value.push(typedEvent);
+  updateActiveRun({ eventCount: Number(event.seq || streamEvents.value.length) });
 
   if (!firstResponseMs.value && ["text", "thinking", "tool_start", "tool_end"].includes(event.type)) {
     firstResponseMs.value = Math.max(1, Math.round(performance.now() - runStartedAt.value));
@@ -1063,6 +1338,7 @@ function finishRun(processStatus = "success") {
   replayingTrace.value = false;
   currentAssistantId.value = "";
   pendingToolCallIds.clear();
+  clearActiveRun();
   loadSessions({ silent: true });
   if (shouldHydratePPT) {
     hydratePPTArtifactForCurrentSession();
@@ -1099,6 +1375,144 @@ function closeStream() {
   if (eventSource.value) {
     eventSource.value.close();
     eventSource.value = null;
+  }
+}
+
+function readActiveRun() {
+  try {
+    return JSON.parse(localStorage.getItem(ACTIVE_RUN_STORAGE_KEY) || "null");
+  } catch {
+    return null;
+  }
+}
+
+function persistActiveRun(run) {
+  if (replayingTrace.value || !run?.conversationId) return;
+  try {
+    localStorage.setItem(ACTIVE_RUN_STORAGE_KEY, JSON.stringify({
+      ...run,
+      updatedAt: new Date().toISOString()
+    }));
+  } catch {
+    // Storage can be unavailable in private mode; streaming still works.
+  }
+}
+
+function updateActiveRun(patch) {
+  const current = readActiveRun();
+  if (!current?.conversationId) return;
+  persistActiveRun({ ...current, ...patch });
+}
+
+function clearActiveRun() {
+  try {
+    localStorage.removeItem(ACTIVE_RUN_STORAGE_KEY);
+  } catch {
+    // Ignore storage failures.
+  }
+}
+
+async function restoreActiveRun() {
+  const run = readActiveRun();
+  if (!run?.conversationId) return;
+
+  try {
+    const payload = await fetchAgentStatus(run.conversationId);
+    const task = payload?.task || {};
+    if (!payload?.running || task.running === false) {
+      clearActiveRun();
+      await reopenRunSession(run.conversationId);
+      return;
+    }
+
+    closeStream();
+    activeView.value = "chat";
+    activeConversationId.value = run.conversationId;
+    activeSessionTitle.value = run.title || compactText(task.query || run.query, run.conversationId);
+    agentType.value = task.agentType || run.agentType || agentType.value;
+    currentTraceId.value = task.traceId || run.traceId || "";
+    traceIdInput.value = currentTraceId.value;
+    traceDetail.value = null;
+    traceError.value = "";
+    errorText.value = "";
+
+    const query = task.query || run.query || "";
+    const assistantId = run.assistantMessage?.id || `assistant-active-${run.conversationId}`;
+    const restoredMessages = await loadPersistedMessagesForRun(run.conversationId, query);
+    if (query && !restoredMessages.some((item) => item.role === "user" && item.content === query)) {
+      restoredMessages.push({
+        id: run.userMessage?.id || `user-active-${run.conversationId}`,
+        role: "user",
+        content: query,
+        createdAt: run.startedAt || new Date().toISOString()
+      });
+    }
+    restoredMessages.push({
+      id: assistantId,
+      role: "assistant",
+      content: "",
+      createdAt: run.startedAt || new Date().toISOString(),
+      process: [],
+      references: []
+    });
+
+    messages.value = restoredMessages;
+    currentAssistantId.value = assistantId;
+    streamEvents.value = [];
+    pendingToolCallIds.clear();
+    firstResponseMs.value = 0;
+    runStartedAt.value = performance.now() - Number(task.runningMs || 0);
+    isRunning.value = true;
+    replayingTrace.value = false;
+
+    persistActiveRun({
+      ...run,
+      query,
+      agentType: agentType.value,
+      traceId: currentTraceId.value,
+      title: activeSessionTitle.value,
+      eventCount: 0
+    });
+    openEventStream(
+      buildAgentAttachURL({ conversationId: run.conversationId, from: 1 }),
+      "SSE reconnect failed"
+    );
+  } catch (error) {
+    clearActiveRun();
+    errorText.value = error.message || "Failed to restore running task";
+  }
+}
+
+async function reopenRunSession(conversationId) {
+  try {
+    const records = await fetchSessionDetail(conversationId);
+    if (!records.length) return;
+    activeView.value = "chat";
+    activeConversationId.value = conversationId;
+    messages.value = records.flatMap(recordToMessages);
+    activeSessionTitle.value = compactText(records[0]?.sessionName || records[0]?.question || conversationId);
+    currentAssistantId.value = "";
+    isRunning.value = false;
+    replayingTrace.value = false;
+    streamEvents.value = [];
+    pendingToolCallIds.clear();
+    hydratePPTArtifactForCurrentSession();
+  } catch {
+    // If history is unavailable, just start clean; the task is no longer active.
+  }
+}
+
+async function loadPersistedMessagesForRun(conversationId, query) {
+  try {
+    const records = await fetchSessionDetail(conversationId);
+    const items = records.flatMap(recordToMessages);
+    const last = items.at(-1);
+    if (last?.role === "assistant" && !last.content && query) {
+      items.pop();
+    }
+    return items;
+  } catch {
+    return [];
   }
 }
 
@@ -1318,6 +1732,57 @@ function focusComposer() {
 
 function sessionPreview(session) {
   return compactText(session.lastQuestion || session.firstQuestion || session.lastAnswer || session.agentType || "", "空会话");
+}
+
+function usageLinePoints(field) {
+  if (!usageSeries.value.length) return "0,200 720,200";
+  return usageSeries.value.map((point, index) => {
+    const { x, y } = usagePointPosition(point, index, field);
+    return `${x},${y}`;
+  }).join(" ");
+}
+
+function usagePointPosition(point, index, field) {
+  const total = Math.max(usageSeries.value.length - 1, 1);
+  const x = Math.round((index / total) * 720);
+  const value = Number(point?.[field] || 0);
+  const y = Math.round(200 - (value / usageChartMax.value) * 176);
+  return { x, y: Math.max(18, Math.min(204, y)) };
+}
+
+function usageAgentLabel(value) {
+  if (!value) return "未知 Agent";
+  return findAgent(value)?.label || value;
+}
+
+function usageRecordKey(record) {
+  return record.id || `${record.requestId || record.traceId || record.createdAt}-${record.model}`;
+}
+
+function numberCompact(value) {
+  const number = Number(value || 0);
+  if (!Number.isFinite(number)) return "0";
+  if (Math.abs(number) >= 1000000) return `${(number / 1000000).toFixed(1)}M`;
+  if (Math.abs(number) >= 10000) return `${(number / 10000).toFixed(1)}万`;
+  return new Intl.NumberFormat("zh-CN").format(Math.round(number));
+}
+
+function percent(value) {
+  const number = Number(value || 0);
+  if (!Number.isFinite(number) || number <= 0) return "0%";
+  return `${Math.min(100, number * 100).toFixed(number < 0.1 ? 1 : 0)}%`;
+}
+
+function formatUsageAxis(value) {
+  if (!value) return "-";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "-";
+  return date.toLocaleString("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit"
+  });
 }
 
 function eventSummary(event) {

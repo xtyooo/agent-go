@@ -81,6 +81,60 @@ func TestStopCancelsContextAndEmitsStopEvents(t *testing.T) {
 	}
 }
 
+func TestRegisterDetachesFromHTTPContext(t *testing.T) {
+	manager := NewManager(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	parent, cancel := context.WithCancel(context.Background())
+	info, err := manager.Register(parent, "c1", "websearch")
+	if err != nil {
+		t.Fatalf("register task: %v", err)
+	}
+	defer manager.Remove(info)
+
+	cancel()
+
+	select {
+	case <-info.Context().Done():
+		t.Fatal("task context should not be canceled by parent request context")
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestSubscribeReplaysBufferedEvents(t *testing.T) {
+	manager := NewManager(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	info, err := manager.Register(context.Background(), "c1", "websearch")
+	if err != nil {
+		t.Fatalf("register task: %v", err)
+	}
+	defer manager.Remove(info)
+
+	source := make(chan event.Event, 2)
+	source <- event.Thinking("one")
+	source <- event.Text("two")
+	close(source)
+
+	for range manager.ForwardEvents(info, source) {
+	}
+
+	records, unsubscribe, snapshot, ok := manager.Subscribe("c1", 2)
+	if !ok {
+		t.Fatal("expected task to be subscribable until removed")
+	}
+	defer unsubscribe()
+	if snapshot.EventCount != 2 {
+		t.Fatalf("event count = %d, want 2", snapshot.EventCount)
+	}
+	record, ok := <-records
+	if !ok {
+		t.Fatal("expected replayed record")
+	}
+	if record.Seq != 2 || record.Event.Type != event.TypeText || record.Event.Seq != 2 {
+		t.Fatalf("unexpected replay record: %#v", record)
+	}
+	if _, ok := <-records; ok {
+		t.Fatal("expected replay channel to close after done task")
+	}
+}
+
 func readEvent(t *testing.T, events <-chan event.Event) event.Event {
 	t.Helper()
 	select {

@@ -99,8 +99,20 @@
             </TabSessionState>
           </value>
         </entry>
+        <entry key="8">
+          <value>
+            <TabSessionState>
+              <option name="provider" value="codex" />
+              <option name="sessionId" value="019ed85e-c6a4-7250-9148-fcd91c3a75f1" />
+              <option name="cwd" value="$PROJECT_DIR$" />
+              <option name="model" value="gpt-5.5" />
+              <option name="permissionMode" value="bypassPermissions" />
+              <option name="reasoningEffort" value="high" />
+            </TabSessionState>
+          </value>
+        </entry>
       </map>
     </option>
-    <option name="tabCount" value="8" />
+    <option name="tabCount" value="9" />
   </component>
 </project>

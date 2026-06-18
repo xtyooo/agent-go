@@ -26,6 +26,7 @@ import (
 	"agentG/internal/runtime/task"
 	"agentG/internal/runtime/tool"
 	"agentG/internal/runtime/trace"
+	"agentG/internal/runtime/usage"
 )
 
 func main() {
@@ -60,11 +61,23 @@ func main() {
 		"trace_directory", cfg.Observability.Trace.Directory,
 	)
 
+	usageStore, err := newUsageStore(cfg, logger)
+	if err != nil {
+		logger.Error("\U0000274C Usage Runtime 閰嶇疆鏃犳晥", "error", err)
+		os.Exit(1)
+	}
+	defer func() {
+		if err := usageStore.Close(); err != nil {
+			logger.Warn("\U000026A0 Usage Runtime 鍏抽棴澶辫触", "error", err)
+		}
+	}()
+
 	chatModel, err := model.NewOpenAICompatible(model.OpenAIConfig{
-		BaseURL: cfg.Model.BaseURL,
-		APIKey:  cfg.Model.APIKey,
-		Model:   cfg.Model.Name,
-		Logger:  logger,
+		BaseURL:    cfg.Model.BaseURL,
+		APIKey:     cfg.Model.APIKey,
+		Model:      cfg.Model.Name,
+		Logger:     logger,
+		UsageStore: usageStore,
 	})
 	if err != nil {
 		logger.Error("\U0000274C 模型运行时配置无效", "error", err)
@@ -210,7 +223,7 @@ func main() {
 
 	server := &http.Server{
 		Addr:              ":" + cfg.Server.Port,
-		Handler:           httpapi.NewRouterWithAgentsTraceAndPPTX(logger, agents, taskManager, memoryStore, traceStore, pptxStore),
+		Handler:           httpapi.NewRouterWithAgentsTracePPTXAndUsage(logger, agents, taskManager, memoryStore, traceStore, pptxStore, usageStore),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
@@ -288,6 +301,39 @@ func newMemoryStore(cfg config.Config, logger *slog.Logger) (memory.Store, error
 	logger.Info("\U0001F4DD Memory Runtime 已启用",
 		"max_history_records", cfg.Memory.MaxHistoryRecords,
 		"auto_migrate", cfg.Memory.AutoMigrate,
+	)
+	return store, nil
+}
+
+func newUsageStore(cfg config.Config, logger *slog.Logger) (usage.Store, error) {
+	if !cfg.Memory.Enabled {
+		logger.Info("Usage Runtime using in-memory store")
+		return usage.NewMemoryStore(), nil
+	}
+
+	store, err := usage.NewMySQLStore(usage.MySQLConfig{
+		DSN:             cfg.Memory.DSN,
+		MaxOpenConns:    cfg.Memory.MaxOpenConns,
+		MaxIdleConns:    cfg.Memory.MaxIdleConns,
+		ConnMaxLifetime: time.Duration(cfg.Memory.ConnMaxLifetimeSeconds) * time.Second,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	if cfg.Memory.AutoMigrate {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := store.EnsureSchema(ctx); err != nil {
+			_ = store.Close()
+			return nil, err
+		}
+		logger.Info("Usage Runtime schema ensured", "table", "ai_model_usage")
+	}
+
+	logger.Info("Usage Runtime enabled",
+		"auto_migrate", cfg.Memory.AutoMigrate,
+		"store", "mysql",
 	)
 	return store, nil
 }

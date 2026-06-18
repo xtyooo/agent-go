@@ -1,9 +1,11 @@
 package http
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -14,6 +16,7 @@ import (
 	"agentG/internal/runtime/event"
 	"agentG/internal/runtime/task"
 	"agentG/internal/runtime/trace"
+	"agentG/internal/runtime/usage"
 )
 
 type AgentHandler struct {
@@ -98,7 +101,7 @@ func (h *AgentHandler) streamAgent(w http.ResponseWriter, r *http.Request, agent
 		"remote_addr", r.RemoteAddr,
 	)
 
-	recorder, err := h.startTrace(r, trace.RunMeta{
+	recorder, err := h.startTrace(context.Background(), trace.RunMeta{
 		TraceID:        traceID,
 		RequestID:      requestID,
 		ConversationID: conversationID,
@@ -116,7 +119,11 @@ func (h *AgentHandler) streamAgent(w http.ResponseWriter, r *http.Request, agent
 		recorder = nil
 	}
 
-	taskInfo, err := h.tasks.Register(r.Context(), conversationID, agentType)
+	taskInfo, err := h.tasks.RegisterWithOptions(context.Background(), conversationID, agentType, task.RegisterOptions{
+		Query:     query,
+		RequestID: requestID,
+		TraceID:   traceID,
+	})
 	if err != nil {
 		logger.Warn("\U000026A0 聊天流请求被拒绝：会话已有任务运行",
 			"conversation_id", conversationID,
@@ -132,9 +139,22 @@ func (h *AgentHandler) streamAgent(w http.ResponseWriter, r *http.Request, agent
 		h.finishTrace(logger, recorder, "failed", err)
 		return
 	}
-	defer h.tasks.Remove(taskInfo)
+	records, unsubscribe, _, ok := h.tasks.Subscribe(conversationID, 1)
+	if !ok {
+		WriteSSEEvent(w, event.Error("TASK_NOT_FOUND", "task is not running", conversationID))
+		h.finishTrace(logger, recorder, "failed", nil)
+		h.tasks.Remove(taskInfo)
+		return
+	}
+	defer unsubscribe()
 
-	events, err := currentAgent.Run(taskInfo.Context(), agent.Input{
+	runCtx := usage.WithMetadata(taskInfo.Context(), usage.Metadata{
+		RequestID:      requestID,
+		TraceID:        traceID,
+		ConversationID: conversationID,
+		AgentType:      agentType,
+	})
+	events, err := currentAgent.Run(runCtx, agent.Input{
 		Query:          query,
 		ConversationID: conversationID,
 		RequestID:      requestID,
@@ -154,22 +174,14 @@ func (h *AgentHandler) streamAgent(w http.ResponseWriter, r *http.Request, agent
 			recorder.Record(errorEvent)
 		}
 		h.finishTrace(logger, recorder, "failed", err)
+		unsubscribe()
+		h.tasks.Remove(taskInfo)
 		return
 	}
-	events = h.tasks.WrapEvents(taskInfo, events)
+	taskRecords := h.tasks.ForwardEvents(taskInfo, events)
+	go h.observeTaskRun(taskInfo, taskRecords, logger, recorder)
 
-	streamSummary := StreamEventsWithOptions(w, r, events, logger, conversationID, requestID, StreamOptions{
-		Observer: func(evt event.Event) {
-			if recorder != nil {
-				recorder.Record(evt)
-			}
-		},
-	})
-	traceStatus := "completed"
-	if r.Context().Err() != nil {
-		traceStatus = "cancelled"
-	}
-	h.finishTrace(logger, recorder, traceStatus, r.Context().Err())
+	streamSummary := StreamTaskRecords(w, r, records, logger, conversationID, requestID, StreamOptions{})
 
 	logger.Info("\U0001F3C1 聊天流请求已结束",
 		"conversation_id", conversationID,
@@ -187,11 +199,36 @@ func (h *AgentHandler) streamAgent(w http.ResponseWriter, r *http.Request, agent
 	)
 }
 
-func (h *AgentHandler) startTrace(r *http.Request, meta trace.RunMeta) (*trace.Recorder, error) {
+func (h *AgentHandler) observeTaskRun(taskInfo *task.Info, records <-chan task.EventRecord, logger *slog.Logger, recorder *trace.Recorder) {
+	status := "completed"
+	var finishErr error
+	for record := range records {
+		if recorder != nil {
+			recorder.Record(record.Event)
+		}
+		if record.Event.Type == event.TypeError {
+			status = "failed"
+			finishErr = errors.New(firstNonEmpty(record.Event.Message, record.Event.Content, record.Event.Detail, string(record.Event.Code)))
+		}
+	}
+	if taskInfo.Context().Err() != nil {
+		if taskInfo.Snapshot().Stopped {
+			status = "stopped"
+			finishErr = nil
+		} else if status != "failed" {
+			status = "cancelled"
+			finishErr = taskInfo.Context().Err()
+		}
+	}
+	h.finishTrace(logger, recorder, status, finishErr)
+	h.tasks.Remove(taskInfo)
+}
+
+func (h *AgentHandler) startTrace(ctx context.Context, meta trace.RunMeta) (*trace.Recorder, error) {
 	if h.traces == nil {
 		return nil, nil
 	}
-	return h.traces.Start(r.Context(), meta)
+	return h.traces.Start(ctx, meta)
 }
 
 func (h *AgentHandler) finishTrace(logger *slog.Logger, recorder *trace.Recorder, status string, finishErr error) {
@@ -251,6 +288,53 @@ func (h *AgentHandler) StopAgent(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (h *AgentHandler) TaskStatus(w http.ResponseWriter, r *http.Request) {
+	conversationID := r.URL.Query().Get("conversationId")
+	if conversationID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"success": false,
+			"message": "conversationId is required",
+		})
+		return
+	}
+	snapshot, ok := h.tasks.Snapshot(conversationID)
+	if !ok {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"success":        true,
+			"running":        false,
+			"conversationId": conversationID,
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"success": true,
+		"running": snapshot.Running,
+		"task":    snapshot,
+	})
+}
+
+func (h *AgentHandler) TaskAttachStream(w http.ResponseWriter, r *http.Request) {
+	requestID := newRequestID()
+	conversationID := r.URL.Query().Get("conversationId")
+	if conversationID == "" {
+		WriteSSEEvent(w, event.Error("BAD_REQUEST", "conversationId is required", "missing conversationId parameter"))
+		return
+	}
+	fromSeq := parseIntQuery(r, "from")
+	if fromSeq < 1 {
+		fromSeq = 1
+	}
+	records, unsubscribe, snapshot, ok := h.tasks.Subscribe(conversationID, fromSeq)
+	if !ok {
+		WriteSSEEvent(w, event.Error("TASK_NOT_FOUND", "task is not running", conversationID))
+		return
+	}
+	defer unsubscribe()
+
+	logger := h.logger.With("request_id", requestID, "conversation_id", conversationID, "trace_id", snapshot.TraceID)
+	StreamTaskRecords(w, r, records, logger, conversationID, requestID, StreamOptions{})
+}
+
 func parseFloatQuery(r *http.Request, name string) (float64, bool) {
 	raw := r.URL.Query().Get(name)
 	if raw == "" {
@@ -280,6 +364,15 @@ func temperaturePtr(value float64, ok bool) *float64 {
 		return nil
 	}
 	return &value
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {

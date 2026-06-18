@@ -11,35 +11,68 @@ import (
 	"agentG/internal/runtime/event"
 )
 
-const stopEventWriteTimeout = 2 * time.Second
+const (
+	defaultMaxBufferedEvents = 1000
+	subscriberBufferSize     = 64
+	stopEventWriteTimeout    = 2 * time.Second
+)
 
-// Manager 管理正在执行的 Agent 流式任务。
-//
-// Java dodo-agent 使用 ConcurrentHashMap 保存 conversationId -> TaskInfo，
-// 并通过 Reactor Disposable 停止模型流。Go 版对应关系是：
-//   - map + sync.Mutex：保存正在执行的任务。
-//   - context.CancelFunc：替代 Disposable，从源头取消模型 HTTP stream 和工具执行。
-//   - channel：替代 Sinks.Many，承载 Agent -> SSE 的事件流。
+// Manager keeps track of active Agent runs and lets HTTP clients reconnect to
+// the same run without owning the run's lifecycle.
 type Manager struct {
 	mu     sync.Mutex
 	tasks  map[string]*Info
 	logger *slog.Logger
 }
 
-// Info 是一次正在运行的 Agent 任务。
-type Info struct {
-	// ConversationID 是任务所属会话，同一会话同一时间只允许一个任务。
-	ConversationID string
-	// AgentType 是当前任务类型，例如 websearch。
-	AgentType string
-	// CreatedAt 是任务注册时间，用于日志和后续超时清理。
-	CreatedAt time.Time
+type RegisterOptions struct {
+	Query     string
+	RequestID string
+	TraceID   string
+}
 
-	ctx     context.Context
-	cancel  context.CancelFunc
-	stopCh  chan struct{}
-	once    sync.Once
+type Snapshot struct {
+	ConversationID  string    `json:"conversationId"`
+	AgentType       string    `json:"agentType"`
+	Query           string    `json:"query,omitempty"`
+	RequestID       string    `json:"requestId,omitempty"`
+	TraceID         string    `json:"traceId,omitempty"`
+	CreatedAt       time.Time `json:"createdAt"`
+	RunningMs       int64     `json:"runningMs"`
+	EventCount      int       `json:"eventCount"`
+	SubscriberCount int       `json:"subscriberCount"`
+	Stopped         bool      `json:"stopped"`
+	Running         bool      `json:"running"`
+}
+
+type EventRecord struct {
+	Seq   int         `json:"seq"`
+	Event event.Event `json:"event"`
+}
+
+// Info represents one running Agent task.
+type Info struct {
+	ConversationID string
+	AgentType      string
+	Query          string
+	RequestID      string
+	TraceID        string
+	CreatedAt      time.Time
+
+	ctx    context.Context
+	cancel context.CancelFunc
+	stopCh chan struct{}
+	once   sync.Once
+
+	manager *Manager
 	stopped atomic.Bool
+
+	mu          sync.Mutex
+	events      []EventRecord
+	nextSeq     int
+	maxBuffered int
+	subscribers map[chan EventRecord]struct{}
+	done        bool
 }
 
 func NewManager(logger *slog.Logger) *Manager {
@@ -52,21 +85,24 @@ func NewManager(logger *slog.Logger) *Manager {
 	}
 }
 
-// Register 注册一个会话任务，并返回派生出来的任务 context。
-// 如果同一个 conversationId 已有任务在执行，返回错误，调用方应拒绝本次请求。
 func (m *Manager) Register(parent context.Context, conversationID string, agentType string) (*Info, error) {
+	return m.RegisterWithOptions(parent, conversationID, agentType, RegisterOptions{})
+}
+
+// RegisterWithOptions registers a task. The execution context is intentionally
+// detached from the HTTP request context so page refreshes only close that SSE
+// client, not the underlying Agent run.
+func (m *Manager) RegisterWithOptions(parent context.Context, conversationID string, agentType string, options RegisterOptions) (*Info, error) {
 	if conversationID == "" {
 		return nil, fmt.Errorf("conversationID is required")
 	}
-	if parent == nil {
-		parent = context.Background()
-	}
+	_ = parent
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	if existing := m.tasks[conversationID]; existing != nil {
-		m.logger.Warn("\U000026A0 会话已有任务正在执行，拒绝注册新任务",
+		m.logger.Warn("conversation already has a running task",
 			"conversation_id", conversationID,
 			"agent_type", existing.AgentType,
 			"running_ms", time.Since(existing.CreatedAt).Milliseconds(),
@@ -74,37 +110,41 @@ func (m *Manager) Register(parent context.Context, conversationID string, agentT
 		return nil, fmt.Errorf("conversation %s already has a running task", conversationID)
 	}
 
-	ctx, cancel := context.WithCancel(parent)
+	ctx, cancel := context.WithCancel(context.Background())
 	info := &Info{
 		ConversationID: conversationID,
 		AgentType:      agentType,
+		Query:          options.Query,
+		RequestID:      options.RequestID,
+		TraceID:        options.TraceID,
 		CreatedAt:      time.Now(),
 		ctx:            ctx,
 		cancel:         cancel,
 		stopCh:         make(chan struct{}),
+		manager:        m,
+		events:         make([]EventRecord, 0, 128),
+		maxBuffered:    defaultMaxBufferedEvents,
+		subscribers:    make(map[chan EventRecord]struct{}),
 	}
 	m.tasks[conversationID] = info
 
-	m.logger.Info("\U0001F4CC Agent 任务已注册",
+	m.logger.Info("agent task registered",
 		"conversation_id", conversationID,
 		"agent_type", agentType,
+		"trace_id", options.TraceID,
 	)
 	return info, nil
 }
 
-// Stop 主动停止一个会话任务。
-// 它会关闭 stopCh 并调用 cancel，使模型流和工具调用尽快收到 context cancellation。
 func (m *Manager) Stop(conversationID string) bool {
-	m.mu.Lock()
-	info := m.tasks[conversationID]
-	m.mu.Unlock()
-	if info == nil {
-		m.logger.Warn("\U000026A0 停止任务失败：未找到运行中的任务", "conversation_id", conversationID)
+	info, ok := m.Get(conversationID)
+	if !ok {
+		m.logger.Warn("stop task failed: task not found", "conversation_id", conversationID)
 		return false
 	}
 
 	info.stop()
-	m.logger.Info("\U0001F6D1 Agent 任务停止信号已发出",
+	m.logger.Info("agent task stop signal sent",
 		"conversation_id", conversationID,
 		"agent_type", info.AgentType,
 		"running_ms", time.Since(info.CreatedAt).Milliseconds(),
@@ -112,8 +152,6 @@ func (m *Manager) Stop(conversationID string) bool {
 	return true
 }
 
-// Remove 清理任务注册表。
-// 正常完成、客户端断开、用户停止后都必须调用，避免任务残留导致后续请求被误判为并发。
 func (m *Manager) Remove(info *Info) {
 	if info == nil {
 		return
@@ -126,7 +164,8 @@ func (m *Manager) Remove(info *Info) {
 	m.mu.Unlock()
 
 	info.cancel()
-	m.logger.Info("\U0001F9F9 Agent 任务已清理",
+	info.close()
+	m.logger.Info("agent task cleaned up",
 		"conversation_id", info.ConversationID,
 		"agent_type", info.AgentType,
 		"stopped", info.stopped.Load(),
@@ -134,25 +173,80 @@ func (m *Manager) Remove(info *Info) {
 	)
 }
 
-// WrapEvents 包装 Agent 原始事件流。
-// 当 Stop 被调用时，这里会向原 SSE 输出一条停止提示并补 complete，然后关闭输出通道。
+func (m *Manager) Get(conversationID string) (*Info, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	info := m.tasks[conversationID]
+	return info, info != nil
+}
+
+func (m *Manager) Snapshot(conversationID string) (Snapshot, bool) {
+	info, ok := m.Get(conversationID)
+	if !ok {
+		return Snapshot{}, false
+	}
+	return info.Snapshot(), true
+}
+
+func (m *Manager) List() []Snapshot {
+	m.mu.Lock()
+	infos := make([]*Info, 0, len(m.tasks))
+	for _, info := range m.tasks {
+		infos = append(infos, info)
+	}
+	m.mu.Unlock()
+
+	snapshots := make([]Snapshot, 0, len(infos))
+	for _, info := range infos {
+		snapshots = append(snapshots, info.Snapshot())
+	}
+	return snapshots
+}
+
+// Subscribe returns a channel that first replays buffered events with seq >=
+// fromSeq and then follows live events. The caller must call unsubscribe.
+func (m *Manager) Subscribe(conversationID string, fromSeq int) (<-chan EventRecord, func(), Snapshot, bool) {
+	info, ok := m.Get(conversationID)
+	if !ok {
+		return nil, func() {}, Snapshot{}, false
+	}
+	ch, unsubscribe := info.subscribe(fromSeq)
+	return ch, unsubscribe, info.Snapshot(), true
+}
+
+// WrapEvents keeps backward compatibility for tests and callers that want a
+// simple channel. It also records and broadcasts the wrapped events.
 func (m *Manager) WrapEvents(info *Info, source <-chan event.Event) <-chan event.Event {
 	out := make(chan event.Event)
+	go func() {
+		defer close(out)
+		for record := range m.ForwardEvents(info, source) {
+			out <- record.Event
+		}
+	}()
+	return out
+}
+
+// ForwardEvents consumes the Agent source stream, records every event, fans it
+// out to subscribers, and closes the task when the source ends or is stopped.
+func (m *Manager) ForwardEvents(info *Info, source <-chan event.Event) <-chan EventRecord {
+	out := make(chan EventRecord)
 	go m.forwardEvents(info, source, out)
 	return out
 }
 
-func (m *Manager) forwardEvents(info *Info, source <-chan event.Event, out chan<- event.Event) {
+func (m *Manager) forwardEvents(info *Info, source <-chan event.Event, out chan<- EventRecord) {
 	defer close(out)
+	defer info.close()
 
 	for {
 		select {
 		case <-info.stopCh:
-			sendStopEvents(context.Background(), out)
+			m.forwardStopEvents(out, info)
 			return
 		case <-info.ctx.Done():
 			if info.stopped.Load() {
-				sendStopEvents(context.Background(), out)
+				m.forwardStopEvents(out, info)
 			}
 			return
 		case evt, ok := <-source:
@@ -161,20 +255,53 @@ func (m *Manager) forwardEvents(info *Info, source <-chan event.Event, out chan<
 			}
 			select {
 			case <-info.stopCh:
-				sendStopEvents(context.Background(), out)
+				m.forwardStopEvents(out, info)
 				return
-			case out <- evt:
+			default:
+			}
+			record := info.appendEvent(evt)
+			if !sendRecord(context.Background(), out, record) {
+				return
 			}
 		}
 	}
 }
 
-// Context 返回任务 context。Agent 必须使用这个 context 调用模型和工具。
+func (m *Manager) forwardStopEvents(out chan<- EventRecord, info *Info) {
+	for _, evt := range []event.Event{
+		event.Thinking("已停止生成\n"),
+		event.Complete(),
+	} {
+		record := info.appendEvent(evt)
+		if !sendRecord(context.Background(), out, record) {
+			return
+		}
+	}
+}
+
 func (i *Info) Context() context.Context {
 	if i == nil || i.ctx == nil {
 		return context.Background()
 	}
 	return i.ctx
+}
+
+func (i *Info) Snapshot() Snapshot {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	return Snapshot{
+		ConversationID:  i.ConversationID,
+		AgentType:       i.AgentType,
+		Query:           i.Query,
+		RequestID:       i.RequestID,
+		TraceID:         i.TraceID,
+		CreatedAt:       i.CreatedAt,
+		RunningMs:       time.Since(i.CreatedAt).Milliseconds(),
+		EventCount:      i.nextSeq,
+		SubscriberCount: len(i.subscribers),
+		Stopped:         i.stopped.Load(),
+		Running:         !i.done,
+	}
 }
 
 func (i *Info) stop() {
@@ -185,13 +312,76 @@ func (i *Info) stop() {
 	})
 }
 
-func sendStopEvents(ctx context.Context, out chan<- event.Event) {
-	sendTaskEvent(ctx, out, event.Thinking("已停止生成\n"))
-	sendTaskEvent(ctx, out, event.Complete())
+func (i *Info) appendEvent(evt event.Event) EventRecord {
+	i.mu.Lock()
+	i.nextSeq++
+	evt.Seq = i.nextSeq
+	record := EventRecord{Seq: i.nextSeq, Event: evt}
+	i.events = append(i.events, record)
+	if len(i.events) > i.maxBuffered {
+		copy(i.events, i.events[len(i.events)-i.maxBuffered:])
+		i.events = i.events[:i.maxBuffered]
+	}
+	for subscriber := range i.subscribers {
+		select {
+		case subscriber <- record:
+		default:
+			// Drop for slow subscribers; they can refresh and replay the buffer.
+		}
+	}
+	i.mu.Unlock()
+	return record
 }
 
-func sendTaskEvent(ctx context.Context, out chan<- event.Event, evt event.Event) bool {
-	// 停止提示只是收尾体验，不能因为前端已经断开而长期阻塞任务清理。
+func (i *Info) subscribe(fromSeq int) (<-chan EventRecord, func()) {
+	i.mu.Lock()
+	replay := make([]EventRecord, 0, len(i.events))
+	for _, record := range i.events {
+		if record.Seq >= fromSeq {
+			replay = append(replay, record)
+		}
+	}
+	ch := make(chan EventRecord, len(replay)+subscriberBufferSize)
+	for _, record := range replay {
+		ch <- record
+	}
+	if i.done {
+		i.mu.Unlock()
+		close(ch)
+		return ch, func() {}
+	}
+	i.subscribers[ch] = struct{}{}
+	i.mu.Unlock()
+
+	var once sync.Once
+	unsubscribe := func() {
+		once.Do(func() {
+			i.mu.Lock()
+			if _, ok := i.subscribers[ch]; ok {
+				delete(i.subscribers, ch)
+				close(ch)
+			}
+			i.mu.Unlock()
+		})
+	}
+	return ch, unsubscribe
+}
+
+func (i *Info) close() {
+	i.mu.Lock()
+	if i.done {
+		i.mu.Unlock()
+		return
+	}
+	i.done = true
+	for subscriber := range i.subscribers {
+		close(subscriber)
+		delete(i.subscribers, subscriber)
+	}
+	i.mu.Unlock()
+}
+
+func sendRecord(ctx context.Context, out chan<- EventRecord, record EventRecord) bool {
 	timer := time.NewTimer(stopEventWriteTimeout)
 	defer timer.Stop()
 
@@ -200,7 +390,7 @@ func sendTaskEvent(ctx context.Context, out chan<- event.Event, evt event.Event)
 		return false
 	case <-timer.C:
 		return false
-	case out <- evt:
+	case out <- record:
 		return true
 	}
 }

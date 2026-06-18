@@ -75,6 +75,12 @@ export async function stopAgent(conversationId) {
   });
 }
 
+export async function fetchAgentStatus(conversationId) {
+  return requestJSON(`/agent/status?conversationId=${encodeURIComponent(conversationId)}`, {
+    allowNotFound: true
+  });
+}
+
 export async function fetchTraceDetail(traceId) {
   return requestJSON(`/trace/detail?traceId=${encodeURIComponent(traceId)}`);
 }
@@ -83,6 +89,17 @@ export async function fetchPPTLatest(conversationId) {
   return requestJSON(`/pptx/latest?conversationId=${encodeURIComponent(conversationId)}`, {
     allowNotFound: true
   });
+}
+
+export async function fetchUsageOverview({ range = "24h", agentType = "", model = "", limit = 100 } = {}) {
+  const params = new URLSearchParams({
+    range,
+    limit: String(limit)
+  });
+  if (agentType) params.set("agentType", agentType);
+  if (model) params.set("model", model);
+  const payload = await requestJSON(`/usage/overview?${params.toString()}`);
+  return payload.data || {};
 }
 
 export function buildPPTPreviewURL(pptId) {
@@ -114,6 +131,14 @@ export function buildStreamURL({ query, conversationId, agentType, temperature, 
   });
   if (traceId) params.set("traceId", traceId);
   return `${agent.streamPath}?${params.toString()}`;
+}
+
+export function buildAgentAttachURL({ conversationId, from = 1 }) {
+  const params = new URLSearchParams({
+    conversationId,
+    from: String(Math.max(1, Number(from) || 1))
+  });
+  return `/agent/attach/stream?${params.toString()}`;
 }
 
 async function requestJSON(url, options = {}) {

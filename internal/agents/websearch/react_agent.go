@@ -103,7 +103,7 @@ func WithSystemPrompt(builder func(time.Time) string) Option {
 }
 
 // WithMaxRounds 设置最大 ReAct 推理轮数。
-// 如果模型持续返回 tool_calls，达到该轮数后会进入 forceFinalStream，要求模型直接总结。
+// 如果模型持续返回 tool_calls，达到该轮数后会由 runtime/react 强制进入最终回答。
 func WithMaxRounds(maxRounds int) Option {
 	return func(a *ReactAgent) {
 		if maxRounds > 0 {
@@ -158,9 +158,9 @@ func (a *ReactAgent) runConfig(input agent.Input) runConfig {
 // 这层只做三件事：
 //  1. 创建一个事件 channel，作为 Agent 到 HTTP SSE 的输出通道。
 //  2. 在 goroutine 中执行完整 ReAct 流程，避免阻塞 HTTP handler。
-//  3. 把用户问题包装成 Java dodo-agent 同款初始 messages，然后交给 scheduleRounds。
+//  3. 把用户问题包装成 Java dodo-agent 同款初始 messages，然后交给 runtime/react loop。
 //
-// 这里不要直接调用模型或工具；真正的 ReAct 轮次控制在 scheduleRounds 中完成。
+// 这里不要直接调用模型或工具；真正的 ReAct 轮次控制在 runtime/react 中完成。
 func (a *ReactAgent) Run(ctx context.Context, input agent.Input) (<-chan event.Event, error) {
 	events := make(chan event.Event, 16)
 	go a.runAsync(ctx, input, events)
@@ -202,6 +202,9 @@ func (a *ReactAgent) runAsync(ctx context.Context, input agent.Input, events cha
 			runRecord.capture(evt, elapsedMillis(startedAt))
 		},
 	})
+	if !sender.Send(event.AgentStart(a.agentType, input.ConversationID, input.RequestID)) {
+		return
+	}
 
 	systemMessages := []model.Message{
 		{Role: model.RoleSystem, Content: a.systemPromptBuilder(time.Now())},
@@ -215,6 +218,7 @@ func (a *ReactAgent) runAsync(ctx context.Context, input agent.Input, events cha
 	state := agentState{searchResults: make([]tool.SearchResult, 0)}
 	loop := reactruntime.New(a.model, a.tools, logger,
 		reactruntime.WithMaxRounds(runCfg.maxRounds),
+		reactruntime.WithStageProviders(a.referenceStageProvider(&state)),
 		reactruntime.WithHooks(reactruntime.Hooks{
 			BeforeTool: func(ctx context.Context, call model.ToolCall, emit func(event.Event) bool) bool {
 				if !strings.Contains(call.Name, "search") {
@@ -425,6 +429,19 @@ func (a *ReactAgent) collectSearchResults(toolName string, result tool.Result, s
 		return
 	}
 	state.searchResults = append(state.searchResults, searchResultsFromAny(raw)...)
+}
+
+func (a *ReactAgent) referenceStageProvider(state *agentState) reactruntime.StageOutputProvider {
+	return reactruntime.StageOutputProviderFunc{
+		ProviderName:   "reference",
+		ProviderTiming: reactruntime.StageBeforeDone,
+		Fn: func(ctx context.Context, stage reactruntime.StageContext) (any, error) {
+			if state == nil || len(state.searchResults) == 0 {
+				return nil, nil
+			}
+			return state.searchResults, nil
+		},
+	}
 }
 
 type agentState struct {

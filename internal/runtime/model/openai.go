@@ -12,6 +12,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"agentG/internal/runtime/usage"
 )
 
 type OpenAICompatible struct {
@@ -24,7 +26,8 @@ type OpenAICompatible struct {
 	// httpClient 复用连接；流式请求不设置整体 Timeout，由 ctx 控制生命周期。
 	httpClient *http.Client
 	// logger 输出模型层观测日志。
-	logger *slog.Logger
+	logger     *slog.Logger
+	usageStore usage.Store
 }
 
 type OpenAIConfig struct {
@@ -35,7 +38,8 @@ type OpenAIConfig struct {
 	// Model 是模型名称。
 	Model string
 	// Logger 可选；为空时使用 slog.Default。
-	Logger *slog.Logger
+	Logger     *slog.Logger
+	UsageStore usage.Store
 }
 
 func NewOpenAICompatible(cfg OpenAIConfig) (*OpenAICompatible, error) {
@@ -56,16 +60,22 @@ func NewOpenAICompatible(cfg OpenAIConfig) (*OpenAICompatible, error) {
 		httpClient: &http.Client{
 			Timeout: 0,
 		},
-		logger: cfg.Logger,
+		logger:     cfg.Logger,
+		usageStore: cfg.UsageStore,
 	}, nil
 }
 
-func (m *OpenAICompatible) Generate(ctx context.Context, req Request) (Response, error) {
+func (m *OpenAICompatible) Generate(ctx context.Context, req Request) (response Response, err error) {
 	logger := m.log()
 	if req.RequestID != "" {
 		logger = logger.With("request_id", req.RequestID)
 	}
 	startedAt := time.Now()
+	defer func() {
+		if err != nil {
+			m.recordUsage(ctx, req, false, false, Usage{}, elapsedMillis(startedAt), err)
+		}
+	}()
 	logger.Info("\U0001F9E0 模型非流式请求开始",
 		"model", m.model,
 		"message_count", len(req.Messages),
@@ -143,7 +153,10 @@ func (m *OpenAICompatible) Generate(ctx context.Context, req Request) (Response,
 		"tool_call_count", len(toolCalls),
 		"elapsed_ms", elapsedMillis(startedAt),
 	)
-	return Response{Content: b.String(), ToolCalls: toolCalls}, nil
+	tokenUsage := decoded.Usage.toModelUsage()
+	response = Response{Content: b.String(), ToolCalls: toolCalls, Usage: tokenUsage}
+	m.recordUsage(ctx, req, false, true, tokenUsage, elapsedMillis(startedAt), nil)
+	return response, nil
 }
 
 func (m *OpenAICompatible) Stream(ctx context.Context, req Request) (<-chan Chunk, error) {
@@ -161,12 +174,13 @@ func (m *OpenAICompatible) Stream(ctx context.Context, req Request) (<-chan Chun
 	)
 
 	body := chatCompletionRequest{
-		Model:       m.model,
-		Messages:    toOpenAIMessages(req.Messages),
-		Tools:       toOpenAITools(req.Tools),
-		Temperature: req.Temperature,
-		MaxTokens:   req.MaxTokens,
-		Stream:      true,
+		Model:         m.model,
+		Messages:      toOpenAIMessages(req.Messages),
+		Tools:         toOpenAITools(req.Tools),
+		Temperature:   req.Temperature,
+		MaxTokens:     req.MaxTokens,
+		Stream:        true,
+		StreamOptions: &streamOptions{IncludeUsage: true},
 	}
 
 	payload, err := json.Marshal(body)
@@ -189,7 +203,9 @@ func (m *OpenAICompatible) Stream(ctx context.Context, req Request) (<-chan Chun
 			"elapsed_ms", elapsedMillis(startedAt),
 			"error", err,
 		)
-		return nil, fmt.Errorf("call model stream: %w", err)
+		wrappedErr := fmt.Errorf("call model stream: %w", err)
+		m.recordUsage(ctx, req, true, false, Usage{}, elapsedMillis(startedAt), wrappedErr)
+		return nil, wrappedErr
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		defer resp.Body.Close()
@@ -200,18 +216,20 @@ func (m *OpenAICompatible) Stream(ctx context.Context, req Request) (<-chan Chun
 			"body_chars", len(msg),
 			"elapsed_ms", elapsedMillis(startedAt),
 		)
-		return nil, fmt.Errorf("model returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(msg)))
+		wrappedErr := fmt.Errorf("model returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(msg)))
+		m.recordUsage(ctx, req, true, false, Usage{}, elapsedMillis(startedAt), wrappedErr)
+		return nil, wrappedErr
 	}
 
 	// 返回 channel 后，真正读取 resp.Body 的工作在 goroutine 中进行；
 	// 这对应 Java Reactor stream 的异步数据流。
 	chunks := make(chan Chunk)
-	go m.streamChunks(ctx, logger, resp, chunks, startedAt)
+	go m.streamChunks(ctx, logger, req, resp, chunks, startedAt)
 
 	return chunks, nil
 }
 
-func (m *OpenAICompatible) streamChunks(ctx context.Context, logger *slog.Logger, resp *http.Response, chunks chan<- Chunk, startedAt time.Time) {
+func (m *OpenAICompatible) streamChunks(ctx context.Context, logger *slog.Logger, req Request, resp *http.Response, chunks chan<- Chunk, startedAt time.Time) {
 	defer close(chunks)
 	defer resp.Body.Close()
 	headersMs := elapsedMillis(startedAt)
@@ -236,6 +254,7 @@ func (m *OpenAICompatible) streamChunks(ctx context.Context, logger *slog.Logger
 	contentChars := 0
 	toolDeltaCount := 0
 	firstChunkMs := int64(-1)
+	tokenUsage := Usage{}
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -268,6 +287,7 @@ func (m *OpenAICompatible) streamChunks(ctx context.Context, logger *slog.Logger
 				"first_model_chunk_ms", firstChunkMs,
 				"elapsed_ms", elapsedMillis(startedAt),
 			)
+			m.recordUsage(ctx, req, true, true, tokenUsage, elapsedMillis(startedAt), nil)
 			sendChunk(ctx, chunks, Chunk{Done: true})
 			return
 		}
@@ -283,10 +303,15 @@ func (m *OpenAICompatible) streamChunks(ctx context.Context, logger *slog.Logger
 				"elapsed_ms", elapsedMillis(startedAt),
 				"error", err,
 			)
-			sendChunk(ctx, chunks, Chunk{Err: fmt.Errorf("parse model stream chunk: %w", err)})
+			wrappedErr := fmt.Errorf("parse model stream chunk: %w", err)
+			m.recordUsage(ctx, req, true, false, tokenUsage, elapsedMillis(startedAt), wrappedErr)
+			sendChunk(ctx, chunks, Chunk{Err: wrappedErr})
 			return
 		}
-		if chunk.Content == "" && len(chunk.ToolCalls) == 0 {
+		if !chunk.Usage.Empty() {
+			tokenUsage = chunk.Usage
+		}
+		if chunk.Content == "" && chunk.ReasoningContent == "" && len(chunk.ToolCalls) == 0 && chunk.Usage.Empty() {
 			continue
 		}
 		if firstChunkMs < 0 {
@@ -310,6 +335,11 @@ func (m *OpenAICompatible) streamChunks(ctx context.Context, logger *slog.Logger
 				"elapsed_ms", elapsedMillis(startedAt),
 				"error", ctx.Err(),
 			)
+			cancelErr := ctx.Err()
+			if cancelErr == nil {
+				cancelErr = errors.New("model stream consumer cancelled")
+			}
+			m.recordUsage(ctx, req, true, false, tokenUsage, elapsedMillis(startedAt), cancelErr)
 			return
 		}
 	}
@@ -325,10 +355,13 @@ func (m *OpenAICompatible) streamChunks(ctx context.Context, logger *slog.Logger
 			"elapsed_ms", elapsedMillis(startedAt),
 			"error", err,
 		)
-		sendChunk(ctx, chunks, Chunk{Err: fmt.Errorf("read model stream: %w", err)})
+		wrappedErr := fmt.Errorf("read model stream: %w", err)
+		m.recordUsage(ctx, req, true, false, tokenUsage, elapsedMillis(startedAt), wrappedErr)
+		sendChunk(ctx, chunks, Chunk{Err: wrappedErr})
 		return
 	}
 
+	m.recordUsage(ctx, req, true, false, tokenUsage, elapsedMillis(startedAt), errors.New("model stream ended before DONE"))
 	logger.Warn("\U000026A0 模型流结束但未收到 DONE 标记",
 		"model", m.model,
 		"line_count", lineCount,
@@ -383,12 +416,65 @@ func parseStreamChunk(data []byte) (Chunk, error) {
 	}
 
 	var b strings.Builder
+	var reasoning strings.Builder
 	var toolCalls []ToolCall
 	for _, choice := range resp.Choices {
 		b.WriteString(choice.Delta.Content)
+		reasoning.WriteString(choice.Delta.ReasoningContent)
 		toolCalls = append(toolCalls, toModelToolCalls(choice.Delta.ToolCalls)...)
 	}
-	return Chunk{Content: b.String(), ToolCalls: toolCalls}, nil
+	return Chunk{Content: b.String(), ReasoningContent: reasoning.String(), ToolCalls: toolCalls, Usage: resp.Usage.toModelUsage()}, nil
+}
+
+func (m *OpenAICompatible) recordUsage(ctx context.Context, req Request, stream bool, success bool, tokenUsage Usage, elapsedMs int64, callErr error) {
+	if m.usageStore == nil {
+		return
+	}
+	meta := usage.MetadataFromContext(ctx)
+	requestID := firstNonEmpty(req.RequestID, meta.RequestID)
+	traceID := firstNonEmpty(req.TraceID, meta.TraceID)
+	conversationID := firstNonEmpty(req.ConversationID, meta.ConversationID)
+	agentType := firstNonEmpty(req.AgentType, meta.AgentType)
+
+	errText := ""
+	if callErr != nil {
+		errText = callErr.Error()
+	}
+	record := usage.Record{
+		RequestID:        requestID,
+		TraceID:          traceID,
+		ConversationID:   conversationID,
+		AgentType:        agentType,
+		Model:            m.model,
+		Stream:           stream,
+		PromptTokens:     tokenUsage.PromptTokens,
+		CompletionTokens: tokenUsage.CompletionTokens,
+		TotalTokens:      tokenUsage.TotalTokens,
+		CachedTokens:     tokenUsage.CachedTokens,
+		ReasoningTokens:  tokenUsage.ReasoningTokens,
+		ElapsedMs:        elapsedMs,
+		Success:          success,
+		Error:            errText,
+		CreatedAt:        time.Now(),
+	}
+	if err := m.usageStore.Save(context.Background(), record); err != nil {
+		m.log().Warn("model usage save failed",
+			"model", m.model,
+			"request_id", requestID,
+			"conversation_id", conversationID,
+			"agent_type", agentType,
+			"error", err,
+		)
+	}
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
 }
 
 func toOpenAITools(tools []ToolDefinition) []openAITool {
@@ -435,12 +521,17 @@ func toModelToolCalls(toolCalls []openAIToolCall) []ToolCall {
 }
 
 type chatCompletionRequest struct {
-	Model       string          `json:"model"`
-	Messages    []openAIMessage `json:"messages"`
-	Tools       []openAITool    `json:"tools,omitempty"`
-	Temperature float64         `json:"temperature,omitempty"`
-	MaxTokens   int             `json:"max_tokens,omitempty"`
-	Stream      bool            `json:"stream"`
+	Model         string          `json:"model"`
+	Messages      []openAIMessage `json:"messages"`
+	Tools         []openAITool    `json:"tools,omitempty"`
+	Temperature   float64         `json:"temperature,omitempty"`
+	MaxTokens     int             `json:"max_tokens,omitempty"`
+	Stream        bool            `json:"stream"`
+	StreamOptions *streamOptions  `json:"stream_options,omitempty"`
+}
+
+type streamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
 }
 
 // openAIMessage 是 OpenAI-compatible API 的原始 message 形状。
@@ -485,15 +576,41 @@ type chatCompletionResponse struct {
 			ToolCalls []openAIToolCall `json:"tool_calls"`
 		} `json:"message"`
 	} `json:"choices"`
+	Usage openAIUsage `json:"usage"`
 }
 
 type chatCompletionStreamResponse struct {
 	Choices []struct {
 		Delta struct {
-			Content   string           `json:"content"`
-			ToolCalls []openAIToolCall `json:"tool_calls"`
+			Content          string           `json:"content"`
+			ReasoningContent string           `json:"reasoning_content"`
+			ToolCalls        []openAIToolCall `json:"tool_calls"`
 		} `json:"delta"`
 	} `json:"choices"`
+	Usage openAIUsage `json:"usage"`
+}
+
+type openAIUsage struct {
+	PromptTokens            int          `json:"prompt_tokens"`
+	CompletionTokens        int          `json:"completion_tokens"`
+	TotalTokens             int          `json:"total_tokens"`
+	PromptTokensDetails     tokenDetails `json:"prompt_tokens_details"`
+	CompletionTokensDetails tokenDetails `json:"completion_tokens_details"`
+}
+
+type tokenDetails struct {
+	CachedTokens    int `json:"cached_tokens"`
+	ReasoningTokens int `json:"reasoning_tokens"`
+}
+
+func (u openAIUsage) toModelUsage() Usage {
+	return Usage{
+		PromptTokens:     u.PromptTokens,
+		CompletionTokens: u.CompletionTokens,
+		TotalTokens:      u.TotalTokens,
+		CachedTokens:     u.PromptTokensDetails.CachedTokens,
+		ReasoningTokens:  u.CompletionTokensDetails.ReasoningTokens,
+	}
 }
 
 var _ Model = (*OpenAICompatible)(nil)
